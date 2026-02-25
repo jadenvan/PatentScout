@@ -14,4 +14,4 @@ build/
 *.log
 service-account-file.json
 .tmp/
-reports/
+reports/*.pdf
