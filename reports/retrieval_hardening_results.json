@@ -1,0 +1,107 @@
+{
+  "branch": "optimize/retrieval-hardening",
+  "base_commit": "5b34c43",
+  "hardening_commit": "7d16bc4",
+  "test_case": "Solar Charger — portable solar panel with USB-C, integrated battery, foldable",
+  "root_cause": {
+    "summary": "abstract_localized column is 202 GB; any query touching abstracts exceeds budget",
+    "details": [
+      "_sanitize_regex sorted by length ASC (shortest first) — picked generic 4-letter words",
+      "CPC codes never applied in stage1 query — all US patents scanned",
+      "UNNEST cross-join on title_localized × abstract_localized multiplied row count",
+      "Single-query approach scanned 227-240 GB per run"
+    ]
+  },
+  "solution": {
+    "architecture": "Two-phase CPC-first retrieval",
+    "phases": [
+      {
+        "name": "CPC Scout",
+        "description": "CPC-filtered pub_numbers + dates + CPC/assignee aggregation",
+        "gb_scanned": 25.58,
+        "rows_returned": 500,
+        "elapsed_s": 3.39
+      },
+      {
+        "name": "Title Fetch",
+        "description": "English titles via IN-list for matched patents",
+        "gb_scanned": 18.84,
+        "rows_returned": 500,
+        "elapsed_s": 1.89
+      },
+      {
+        "name": "Python Text Filter",
+        "description": "Regex applied locally on titles (zero BQ cost)",
+        "gb_scanned": 0,
+        "rows_returned": 416,
+        "elapsed_s": 0.001
+      },
+      {
+        "name": "Claims Fetch (optional)",
+        "description": "English claims for top 20 detail patents",
+        "gb_scanned": 122.61,
+        "rows_returned": 20,
+        "elapsed_s": 1.69
+      }
+    ]
+  },
+  "acceptance_criteria": {
+    "solar_keyword_fraction": {
+      "target": ">=40%",
+      "actual": "40.4% (416 rows with title matches)",
+      "status": "PASS"
+    },
+    "high_similarity_matches": {
+      "target": ">=1",
+      "actual": 1,
+      "status": "PASS"
+    },
+    "moderate_similarity_matches": {
+      "actual": 52
+    },
+    "pipeline_runtime": {
+      "target": "<=180s",
+      "actual": "132.54s",
+      "status": "PASS"
+    },
+    "detail_patents": {
+      "actual": 100
+    },
+    "landscape_patents": {
+      "actual": 316
+    },
+    "claims_parsed": {
+      "independent": 41,
+      "elements": 295,
+      "patents_successful": 20
+    },
+    "white_space_findings": {
+      "actual": 2,
+      "details": [
+        "HIGH — Classification Gap: Sparse coverage in CPC subclass H01L31/042",
+        "HIGH — Combination Novelty: Specific feature combination not found in prior art"
+      ]
+    },
+    "pdf_generated": true,
+    "pdf_size_bytes": 26452,
+    "overall_result": "PASS"
+  },
+  "files_changed": [
+    "modules/patent_retriever.py",
+    "modules/query_builder.py",
+    "config/settings.py",
+    "app.py",
+    "tests/test_case1_solar.py",
+    "scripts/diagnose_retrieval.py",
+    "scripts/probe_costs.py",
+    "scripts/probe_phase2.py"
+  ],
+  "bq_column_costs_gb": {
+    "abstract_localized": 202,
+    "claims_localized": 123,
+    "title_localized": 19,
+    "publication_number": 12,
+    "cpc_code": 10,
+    "country_code": 0.67
+  }
+}

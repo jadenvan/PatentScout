@@ -142,8 +142,8 @@ def main() -> None:  # noqa: C901
 
     if detail_df.empty:
         print("  [ERROR] detail_df is empty — cannot continue pipeline")
-        _print_summary(phase1_time, phase2_time, *["N/A"] * 6, pipeline_start)
-        assert False, "FAIL: detail_df is empty after all BigQuery fallbacks"
+        print(f"  TOTAL: {time.time() - pipeline_start:.2f}s")
+        sys.exit("FAIL: detail_df is empty after all BigQuery fallbacks")
 
     if not detail_df.empty:
         print(f"  Sample pub numbers : {detail_df['publication_number'].head(5).tolist()}")

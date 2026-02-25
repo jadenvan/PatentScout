@@ -159,13 +159,13 @@ class PatentRetriever:
             Google Patents URLs.
         """
         text_filter  = search_strategy.get("text_filter", "TRUE")
-        cpc_filter   = search_strategy.get("cpc_filter", "")
-        cpc_prefixes = search_strategy.get("cpc_prefixes", [])
 
-        # Build CPC filter from cpc_codes if not pre-built
-        if not cpc_filter or cpc_filter.startswith("TRUE"):
-            cpc_prefixes = self._extract_cpc_prefixes(search_strategy)
-            cpc_filter = self._build_cpc_exists_clause(cpc_prefixes)
+        # Always rebuild CPC EXISTS clause from cpc_codes — the strategy
+        # dict may contain a cpc_filter in the old single-query format
+        # (cpc_item.code LIKE ...) which is incompatible with the two-phase
+        # scout query that uses UNNEST(cpc) AS c.
+        cpc_prefixes = self._extract_cpc_prefixes(search_strategy)
+        cpc_filter   = self._build_cpc_exists_clause(cpc_prefixes)
 
         print("\n" + "=" * 72)
         print("[PatentRetriever] text_filter:\n" + text_filter)
