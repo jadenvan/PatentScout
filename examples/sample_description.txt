@@ -1,0 +1,30 @@
+PATENTSCOUT — SAMPLE INVENTION DESCRIPTION (Test Case 1)
+=========================================================
+
+Title: Foldable Solar Charger with Integrated Battery Pack
+
+Description:
+A portable solar panel that folds into a compact case and charges mobile
+phones via USB-C connection. It includes an integrated battery pack for
+storing energy when sunlight is not available.
+
+Key Technical Features:
+1. Foldable photovoltaic panel array using flexible or rigid mono/polycrystalline
+   cells enclosed in a hinged weatherproof case
+2. Maximum Power Point Tracking (MPPT) charge controller for optimal energy
+   harvesting across variable sunlight conditions
+3. Integrated lithium-ion or LiFePO4 battery pack (10,000–26,800 mAh range)
+   for energy storage when sunlight is unavailable
+4. USB-C Power Delivery (PD) output port supporting up to 65W fast charging
+5. USB-A legacy output port for simultaneous device charging
+6. LED charge status indicator and battery level display
+7. Over-voltage, over-current, and short-circuit protection circuitry
+
+Expected Patent Landscape:
+- High patent density area — solar portable chargers are a mature category
+- Expected assignees: Anker, Goal Zero, BioLite, RAVPower, Jackery, Renogy
+- Relevant CPC codes: H02J7/35, H01L31/042, H02S10/30, H02J7/00
+
+Use this description as a sample input when testing PatentScout. Paste the
+text above the dashed line into the "Describe your invention" text area in
+the sidebar and click Analyze.

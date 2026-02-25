@@ -1,0 +1,1 @@
+"""PatentScout config package."""

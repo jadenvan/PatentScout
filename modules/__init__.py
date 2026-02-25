@@ -1,0 +1,1 @@
+"""PatentScout modules package."""

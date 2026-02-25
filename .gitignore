@@ -1,0 +1,15 @@
+.env
+credentials/
+.streamlit/secrets.toml
+__pycache__/
+*.pyc
+.venv/
+venv/
+*.json
+!examples/*.json
+*.egg-info/
+dist/
+build/
+.DS_Store
+*.log
+service-account-file.json
