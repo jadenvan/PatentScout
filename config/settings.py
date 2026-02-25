@@ -2,7 +2,8 @@
 PatentScout Configuration Settings
 
 Central location for all application constants and environment-driven
-configuration values.
+configuration values.  Every numeric threshold can be overridden at runtime
+via the corresponding environment variable (see names below).
 """
 
 import os
@@ -18,28 +19,56 @@ BIGQUERY_PROJECT = os.getenv("GOOGLE_CLOUD_PROJECT", "")
 
 # ---------------------------------------------------------------------------
 # Similarity thresholds (cosine similarity, 0–1)
+# Override via env:  SIMILARITY_THRESHOLD_HIGH / MODERATE / LOW
+# Calibrated defaults (2026-02): lower thresholds improve recall for
+# patent-language descriptions since claim text differs from natural language.
 # ---------------------------------------------------------------------------
-SIMILARITY_THRESHOLD_HIGH = 0.75
-SIMILARITY_THRESHOLD_MODERATE = 0.50
-SIMILARITY_THRESHOLD_LOW = 0.30
+SIMILARITY_THRESHOLD_HIGH     = float(os.getenv("SIMILARITY_THRESHOLD_HIGH",     "0.65"))
+SIMILARITY_THRESHOLD_MODERATE = float(os.getenv("SIMILARITY_THRESHOLD_MODERATE", "0.45"))
+SIMILARITY_THRESHOLD_LOW      = float(os.getenv("SIMILARITY_THRESHOLD_LOW",      "0.30"))
 
 # ---------------------------------------------------------------------------
 # Query limits
 # ---------------------------------------------------------------------------
-MAX_PATENTS_DETAIL = 20       # Patents shown in detailed comparison view
-MAX_PATENTS_LANDSCAPE = 500   # Patents loaded for landscape visualisation
+MAX_PATENTS_DETAIL   = 20    # Patents shown in detailed comparison view
+MAX_PATENTS_LANDSCAPE = 500  # Patents loaded for landscape visualisation
 
-BQ_QUERY_LIMIT_DETAIL = 100   # LIMIT clause for detail queries
-BQ_QUERY_LIMIT_LANDSCAPE = 500  # LIMIT clause for landscape queries
+BQ_QUERY_LIMIT_DETAIL    = 100   # LIMIT clause for detail queries
+BQ_QUERY_LIMIT_LANDSCAPE = 500   # LIMIT clause for landscape queries
 
-# Cap each BigQuery job at 500 GB billed.
-# The patents-public-data.patents.publications table requires ~200-350 GB
-# for a full-text REGEXP_CONTAINS scan across all US grants.  BigQuery's
-# on-demand free tier provides 1 TB of free query processing per month, so
-# most development / test runs fall within the free allocation.
-BQ_MAX_BYTES_BILLED = 500_000_000_000  # 500 GB
+# ---------------------------------------------------------------------------
+# BigQuery billing caps
+# ---------------------------------------------------------------------------
+# Stage-1 (title + abstract text search): cap at 20 GB — enough for
+# selective REGEXP_CONTAINS with a 2000-01-01 date cutoff on US-only patents.
+# Override via env:  BQ_MAX_BYTES_BILLED (applies to every individual job).
+BQ_MAX_BYTES_BILLED: int = int(
+    os.getenv("BQ_MAX_BYTES_BILLED", str(20_000_000_000))   # 20 GB default
+)
+# Fallback cap used when the primary cap is hit (title-only search).
+BQ_FALLBACK_BYTES_BILLED: int = int(
+    os.getenv("BQ_FALLBACK_BYTES_BILLED", str(5_000_000_000))  # 5 GB
+)
+# Maximum two-stage attempts before giving up.
+BQ_MAX_FALLBACK_ATTEMPTS: int = int(os.getenv("BQ_MAX_FALLBACK_ATTEMPTS", "2"))
+
+# ---------------------------------------------------------------------------
+# Query cost logging
+# ---------------------------------------------------------------------------
+# JSON file where per-query bytes / elapsed are appended.
+QUERY_COST_LOG_PATH: str = os.getenv("QUERY_COST_LOG_PATH", ".tmp/query_costs.json")
 
 # ---------------------------------------------------------------------------
 # Embedding model
+# Primary and fallback model names for sentence-transformers.
+# Override via env:  EMBEDDING_MODEL_NAME
 # ---------------------------------------------------------------------------
-EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
+EMBEDDING_MODEL_NAME          = os.getenv("EMBEDDING_MODEL_NAME", "all-MiniLM-L6-v2")
+EMBEDDING_MODEL_FALLBACK_NAME = os.getenv("EMBEDDING_MODEL_FALLBACK_NAME", "all-MiniLM-L4-v2")
+
+# ---------------------------------------------------------------------------
+# Gemini reformulation settings
+# ---------------------------------------------------------------------------
+REFORMULATION_MAX_RETRIES: int = int(os.getenv("REFORMULATION_MAX_RETRIES", "2"))
+CONTEXTUAL_ANALYSIS_MAX_PAIRS: int = int(os.getenv("CONTEXTUAL_ANALYSIS_MAX_PAIRS", "10"))
+CONTEXTUAL_ANALYSIS_BATCH_SIZE: int = int(os.getenv("CONTEXTUAL_ANALYSIS_BATCH_SIZE", "5"))

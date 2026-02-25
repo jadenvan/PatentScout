@@ -131,6 +131,11 @@ def _init_session_state() -> None:
         "chart_images": {},           # dict of PNG bytes for PDF export
         "white_spaces": None,         # list[dict] from WhiteSpaceFinder
         "_pdf_bytes": None,            # bytes from ReportGenerator.generate()
+        # Cost monitoring
+        "query_costs": [],             # list of per-query cost records
+        "total_gb_scanned": 0.0,       # cumulative GB scanned this session
+        # Query result cache (key → {"detail_df": ..., "landscape_df": ...})
+        "query_cache": {},
     }
     for key, default in defaults.items():
         if key not in st.session_state:
@@ -138,6 +143,102 @@ def _init_session_state() -> None:
 
 
 _init_session_state()
+
+# ---------------------------------------------------------------------------
+# Query cache helpers
+# ---------------------------------------------------------------------------
+
+import hashlib
+
+def get_cache_key(search_strategy: dict) -> str:
+    """Build a stable cache key from the search_terms primary values."""
+    terms = search_strategy.get("search_terms", [])
+    key_parts = sorted(t.get("primary", "") for t in terms)
+    raw = json.dumps(key_parts, sort_keys=True)
+    return hashlib.sha256(raw.encode()).hexdigest()[:16]
+
+
+# ---------------------------------------------------------------------------
+# Demo session helpers
+# ---------------------------------------------------------------------------
+
+_DEMO_SESSION_PATH = os.path.join(
+    os.path.dirname(__file__), "examples", "solar_charger_session.json"
+)
+
+
+def _save_demo_session() -> None:
+    """Persist the current session state to examples/solar_charger_session.json."""
+    import pandas as pd
+
+    def _serial(obj):
+        if isinstance(obj, pd.DataFrame):
+            return obj.to_dict(orient="records")
+        if isinstance(obj, (bytes, bytearray)):
+            return None   # skip binary blobs
+        if hasattr(obj, "tolist"):
+            return obj.tolist()
+        return str(obj)
+
+    snapshot = {
+        "invention_text":   st.session_state.get("invention_text", ""),
+        "search_strategy":  st.session_state.get("search_strategy"),
+        "detail_patents":   _serial(st.session_state.get("detail_patents")),
+        "landscape_patents": _serial(st.session_state.get("landscape_patents")),
+        "parsed_claims":    st.session_state.get("parsed_claims"),
+        "similarity_results": {
+            k: v if not hasattr(v, "tolist") else v.tolist()
+            for k, v in (st.session_state.get("similarity_results") or {}).items()
+            if k != "matrix"
+        },
+        "comparison_matrix": st.session_state.get("comparison_matrix"),
+        "white_spaces":     st.session_state.get("white_spaces"),
+        "query_costs":      st.session_state.get("query_costs", []),
+        "total_gb_scanned": st.session_state.get("total_gb_scanned", 0.0),
+    }
+    os.makedirs(os.path.dirname(_DEMO_SESSION_PATH), exist_ok=True)
+    try:
+        with open(_DEMO_SESSION_PATH, "w") as fh:
+            json.dump(snapshot, fh, indent=2, default=_serial)
+        logger.info("Demo session saved to %s", _DEMO_SESSION_PATH)
+    except Exception as exc:
+        logger.warning("Could not save demo session: %s", exc)
+
+
+def _load_demo_session() -> bool:
+    """Load the canonical demo session from disk into st.session_state.
+    Returns True on success."""
+    import pandas as pd
+
+    if not os.path.exists(_DEMO_SESSION_PATH):
+        return False
+    try:
+        with open(_DEMO_SESSION_PATH) as fh:
+            snap = json.load(fh)
+
+        st.session_state["invention_text"] = snap.get("invention_text", "")
+        st.session_state["search_strategy"] = snap.get("search_strategy")
+
+        raw_detail = snap.get("detail_patents")
+        if raw_detail:
+            st.session_state["detail_patents"] = pd.DataFrame(raw_detail)
+
+        raw_landscape = snap.get("landscape_patents")
+        if raw_landscape:
+            st.session_state["landscape_patents"] = pd.DataFrame(raw_landscape)
+
+        st.session_state["parsed_claims"]     = snap.get("parsed_claims")
+        st.session_state["similarity_results"] = snap.get("similarity_results")
+        st.session_state["comparison_matrix"] = snap.get("comparison_matrix")
+        st.session_state["white_spaces"]       = snap.get("white_spaces")
+        st.session_state["query_costs"]        = snap.get("query_costs", [])
+        st.session_state["total_gb_scanned"]   = snap.get("total_gb_scanned", 0.0)
+        st.session_state["analysis_complete"]  = True
+        return True
+    except Exception as exc:
+        logger.warning("Could not load demo session: %s", exc)
+        return False
+
 
 # ---------------------------------------------------------------------------
 # Helper: results renderer  (defined BEFORE any code that calls it)
@@ -751,6 +852,26 @@ with st.sidebar:
 
     st.caption("PatentScout is a research tool, not legal advice.")
 
+    # -- Demo load button -------------------------------------------------
+    st.divider()
+    demo_exists = os.path.exists(_DEMO_SESSION_PATH)
+    if demo_exists:
+        if st.button("🚀 Load Solar Charger Demo", use_container_width=True):
+            if _load_demo_session():
+                st.success("Demo session loaded!")
+                st.rerun()
+            else:
+                st.error("Could not load demo session file.")
+
+    # -- Query cost widget -------------------------------------------------
+    total_gb = st.session_state.get("total_gb_scanned", 0.0) or 0.0
+    if total_gb > 0:
+        st.caption(f"📊 Total GB scanned this session: **{total_gb:.2f} GB**")
+        if total_gb > 15:
+            st.warning(
+                f"⚠️ {total_gb:.1f} GB scanned — approaching 20 GB budget cap."
+            )
+
     # Handle Clear
     if clear_clicked:
         st.session_state["invention_text"] = ""
@@ -847,40 +968,78 @@ elif analyze_clicked:
                 f"codes, generated {n_terms} search term groups"
             )
 
-            # -- Patent retrieval ------------------------------------------
-            retrieval_error: str | None = None
-            with st.spinner("Searching patent database (⏳ usually 15–30 s)..."):
+            # -- Feature reformulation into patent language ----------------
+            with st.spinner("Reformulating features into patent language..."):
                 try:
-                    _bq_client = _get_bigquery_client()
-                    retriever = PatentRetriever(bq_client=_bq_client)
-                    detail_df, landscape_df = retriever.search(strategy)
-                    st.session_state["detail_patents"]    = detail_df
-                    st.session_state["landscape_patents"] = landscape_df
-                    st.session_state["analysis_complete"] = True
+                    strategy["features"] = qb.reformulate_features_for_patent_language(
+                        strategy.get("features", [])
+                    )
+                    st.session_state["search_strategy"] = strategy
+                    reformulated = sum(
+                        1 for f in strategy["features"] if f.get("patent_language")
+                    )
+                    st.caption(
+                        f"🔬 Patent-language reformulation: "
+                        f"{reformulated}/{n_features} features rewritten."
+                    )
+                except Exception as _ref_exc:
+                    logger.warning("Feature reformulation failed: %s", _ref_exc)
+                    st.caption(
+                        "ℹ️ Reformulation skipped — using original descriptions for similarity."
+                    )
 
-                    # -- Landscape visualisations --------------------------
-                    if landscape_df is not None and not landscape_df.empty:
-                        try:
-                            _analyzer = LandscapeAnalyzer(landscape_df)
-                            _figs = {
-                                "filing_trends": _analyzer.filing_trends(),
-                                "top_assignees": _analyzer.top_assignees(),
-                                "cpc_distribution": _analyzer.cpc_distribution(),
-                            }
-                            st.session_state["landscape_figures"] = _figs
-                            st.session_state["chart_images"] = (
-                                _analyzer.export_charts_as_images(_figs)
-                            )
-                        except Exception as _la_exc:
-                            logger.warning(
-                                "LandscapeAnalyzer failed: %s", _la_exc
-                            )
-                            st.session_state["landscape_figures"] = {}
-                            st.session_state["chart_images"] = {}
+            # -- Patent retrieval with query cache -------------------------
+            _cache_key = get_cache_key(strategy)
+            _cache = st.session_state.get("query_cache", {})
 
-                except Exception as exc:
-                    retrieval_error = str(exc)
-                    st.session_state["analysis_complete"] = True
+            retrieval_error: str | None = None
+            if _cache_key in _cache:
+                detail_df   = _cache[_cache_key]["detail_df"]
+                landscape_df = _cache[_cache_key]["landscape_df"]
+                st.session_state["detail_patents"]    = detail_df
+                st.session_state["landscape_patents"] = landscape_df
+                st.session_state["analysis_complete"] = True
+                st.caption("♻️ Results loaded from session cache (no new BigQuery charges).")
+            else:
+                with st.spinner("Searching patent database (⏳ usually 15–30 s)..."):
+                    try:
+                        _bq_client = _get_bigquery_client()
+                        retriever = PatentRetriever(bq_client=_bq_client)
+                        detail_df, landscape_df = retriever.search(strategy)
+                        st.session_state["detail_patents"]    = detail_df
+                        st.session_state["landscape_patents"] = landscape_df
+                        st.session_state["analysis_complete"] = True
+
+                        # Cache results to avoid re-charging on re-runs
+                        _cache[_cache_key] = {
+                            "detail_df":    detail_df,
+                            "landscape_df": landscape_df,
+                        }
+                        st.session_state["query_cache"] = _cache
+
+                        # -- Landscape visualisations ----------------------
+                        if landscape_df is not None and not landscape_df.empty:
+                            try:
+                                _analyzer = LandscapeAnalyzer(landscape_df)
+                                _figs = {
+                                    "filing_trends": _analyzer.filing_trends(),
+                                    "top_assignees": _analyzer.top_assignees(),
+                                    "cpc_distribution": _analyzer.cpc_distribution(),
+                                }
+                                st.session_state["landscape_figures"] = _figs
+                                st.session_state["chart_images"] = (
+                                    _analyzer.export_charts_as_images(_figs)
+                                )
+                            except Exception as _la_exc:
+                                logger.warning(
+                                    "LandscapeAnalyzer failed: %s", _la_exc
+                                )
+                                st.session_state["landscape_figures"] = {}
+                                st.session_state["chart_images"] = {}
+
+                    except Exception as exc:
+                        retrieval_error = str(exc)
+                        st.session_state["analysis_complete"] = True
 
             if retrieval_error:
                 quota_hint = (
@@ -1045,7 +1204,22 @@ elif analyze_clicked:
             _render_results()
             _elapsed = time.time() - _pipeline_start
             logger.info("Full pipeline completed in %.1f s", _elapsed)
-            st.caption(f"⏱ Analysis completed in {_elapsed:.0f} seconds.")
+            _total_gb = st.session_state.get("total_gb_scanned", 0.0) or 0.0
+            st.caption(
+                f"⏱ Analysis completed in {_elapsed:.0f} seconds.  "
+                f"📊 Total GB scanned: {_total_gb:.2f} GB"
+            )
+
+            # Auto-save demo session if invention matches solar charger keyword
+            _inv_text = st.session_state.get("invention_text", "").lower()
+            if any(kw in _inv_text for kw in ("solar", "portable charger", "usb-c", "foldable")):
+                try:
+                    _save_demo_session()
+                    st.caption(
+                        "💾 Demo session saved to `examples/solar_charger_session.json`"
+                    )
+                except Exception as _save_exc:
+                    logger.warning("Demo save failed: %s", _save_exc)
         except Exception as exc:
             logger.exception("Pipeline top-level exception")
             st.error(

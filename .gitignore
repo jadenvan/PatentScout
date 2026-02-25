@@ -13,3 +13,5 @@ build/
 .DS_Store
 *.log
 service-account-file.json
+.tmp/
+reports/

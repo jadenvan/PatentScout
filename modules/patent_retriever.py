@@ -6,17 +6,24 @@ and returns normalised DataFrames for the Prior Art and Landscape tabs.
 
 Design notes
 ------------
-* Two-step approach to avoid cartesian explosion from multiple UNNEST calls:
-    Step 1 — text / abstract search → core patent fields
-    Step 2 — second query for CPC + assignee metadata on the found patents
-* Fallback chain:  regex  →  LIKE  →  broad title-only search
-* Query billing is capped at BQ_MAX_BYTES_BILLED (default 5 GB) to prevent
-  runaway costs on the BigQuery free tier.
+* Two-stage approach to minimise bytes scanned:
+    Stage 1 — title + abstract text search → list of publication_numbers
+    Stage 2 — targeted IN-list queries for CPC, assignees, and claims
+* Every BigQuery job is capped at BQ_MAX_BYTES_BILLED (default 20 GB).
+* If a job exceeds the cap an automatic fallback chain runs:
+    Fallback 1: restrict filing_date window (>2010-01-01) — same cap
+    Fallback 2: title-only search at BQ_FALLBACK_BYTES_BILLED (5 GB)
+* Per-query bytes processed and elapsed time are appended to
+  .tmp/query_costs.json and to st.session_state['query_costs'] when
+  Streamlit is active (non-blocking — failures are silently suppressed).
 """
 
 from __future__ import annotations
 
+import json
+import os
 import re
+import time
 import logging
 from typing import Optional
 
@@ -28,24 +35,66 @@ from config import settings
 
 logger = logging.getLogger(__name__)
 
+# Alternative cutoff used in fallback #1 (filing_date > 2010)
+_DATE_CUTOFF      = 20000101   # primary
+_DATE_CUTOFF_FB1  = 20100101   # fallback #1 — narrower date window
+
 
 # ---------------------------------------------------------------------------
-# BigQuery patents-public-data schema reference (key nested fields):
-#
-# publication_number   STRING   "US-7479949-B2"
-# country_code         STRING   "US"
-# title_localized      RECORD REPEATED  .text / .language
-# abstract_localized   RECORD REPEATED  .text / .language
-# claims_localized     RECORD REPEATED  .text / .language
-# cpc                  RECORD REPEATED  .code
-# assignee_harmonized  RECORD REPEATED  .name
-# filing_date          INTEGER  YYYYMMDD
-# grant_date           INTEGER  YYYYMMDD
-# publication_date     INTEGER  YYYYMMDD
-# family_id            STRING
+# Cost logging helpers
 # ---------------------------------------------------------------------------
 
-_DATE_CUTOFF = 20000101          # ignore patents filed before 2000
+def _ensure_tmp_dir() -> None:
+    """Ensure the .tmp directory exists (creates it silently if absent)."""
+    os.makedirs(".tmp", exist_ok=True)
+
+
+def _log_query_cost(
+    query_name: str,
+    bytes_processed: int,
+    elapsed_s: float,
+) -> None:
+    """Append a per-query cost record to .tmp/query_costs.json.
+
+    Also pushes to st.session_state['query_costs'] and increments
+    st.session_state['total_gb_scanned'] when Streamlit is available.
+    """
+    _ensure_tmp_dir()
+    gb = bytes_processed / 1e9
+    record = {
+        "query_name": query_name,
+        "gb":         round(gb, 4),
+        "elapsed_s":  round(elapsed_s, 3),
+        "timestamp":  time.strftime("%Y-%m-%dT%H:%M:%S"),
+    }
+
+    # -- Write to JSON log -------------------------------------------------
+    log_path = settings.QUERY_COST_LOG_PATH
+    try:
+        _ensure_tmp_dir()
+        existing: list = []
+        if os.path.exists(log_path):
+            with open(log_path) as fh:
+                try:
+                    existing = json.load(fh)
+                except (json.JSONDecodeError, ValueError):
+                    existing = []
+        existing.append(record)
+        with open(log_path, "w") as fh:
+            json.dump(existing, fh, indent=2)
+    except Exception as exc:
+        logger.warning("Could not write query cost log: %s", exc)
+
+    # -- Push to Streamlit session state (non-blocking) -------------------
+    try:
+        import streamlit as st
+        if "query_costs" not in st.session_state:
+            st.session_state["query_costs"] = []
+        st.session_state["query_costs"].append(record)
+        prev = st.session_state.get("total_gb_scanned", 0.0) or 0.0
+        st.session_state["total_gb_scanned"] = round(prev + gb, 4)
+    except Exception:
+        pass  # Streamlit not available — ignore
 
 
 class PatentRetriever:
@@ -71,8 +120,13 @@ class PatentRetriever:
             self._client = bq_client
         else:
             self._client = bigquery.Client(project=settings.BIGQUERY_PROJECT)
+        # Primary job config — capped at configured limit
         self._job_config = bigquery.QueryJobConfig(
             maximum_bytes_billed=settings.BQ_MAX_BYTES_BILLED
+        )
+        # Fallback job config — lower cap for title-only searches
+        self._fallback_job_config = bigquery.QueryJobConfig(
+            maximum_bytes_billed=settings.BQ_FALLBACK_BYTES_BILLED
         )
 
     # ------------------------------------------------------------------
@@ -133,12 +187,19 @@ class PatentRetriever:
         text_filter: str,
         limit: int,
         include_claims: bool = False,  # always ignored — claims fetched in Step 2
+        date_cutoff: int = _DATE_CUTOFF,
     ) -> str:
         """Return a BigQuery SQL for the first step (core patent fields).
 
         Claims are intentionally excluded here: UNNEST(claims_localized) on the
         full publications table costs ~350 GB per query.  Claims are fetched
         cheaply in a targeted Step-2 query once we have a short patent list.
+
+        Args:
+            date_cutoff: integer YYYYMMDD lower bound for filing_date.  Using a
+                         more recent cutoff (e.g. 20100101) is the primary
+                         mechanism for reducing bytes scanned when the full
+                         range query hits the billing cap.
         """
         return f"""
         SELECT DISTINCT
@@ -159,7 +220,7 @@ class PatentRetriever:
             AND abstract.language = 'en'
             AND country_code  = 'US'
             AND grant_date    > 0
-            AND filing_date   > {_DATE_CUTOFF}
+            AND filing_date   > {date_cutoff}
             AND ({text_filter})
         ORDER BY publication_date DESC
         LIMIT {limit}
@@ -205,68 +266,94 @@ class PatentRetriever:
     # Fetch helpers
     # ------------------------------------------------------------------
 
-    def _run_query(self, sql: str, stage_label: str = "") -> pd.DataFrame:
+    def _run_query(
+        self,
+        sql: str,
+        stage_label: str = "",
+        job_config: "bigquery.QueryJobConfig | None" = None,
+    ) -> pd.DataFrame:
         """Execute *sql* with billing cap and return a DataFrame.
 
         ``create_bqstorage_client=False`` forces the standard paginated REST
         downloader rather than the BigQuery Storage Read API, avoiding the need
         for the ``bigquery.readsessions.create`` IAM permission.
+
+        Per-query bytes processed and elapsed time are appended to the cost log.
         """
-        job = self._client.query(sql, job_config=self._job_config)
-        df = job.to_dataframe(create_bqstorage_client=False)
+        if job_config is None:
+            job_config = self._job_config
+
+        t0 = time.time()
+        job = self._client.query(sql, job_config=job_config)
+        df  = job.to_dataframe(create_bqstorage_client=False)
+        elapsed = time.time() - t0
+
         bytes_billed    = job.total_bytes_billed    or 0
         bytes_processed = job.total_bytes_processed or 0
         label = f"[{stage_label}] " if stage_label else ""
         logger.info(
-            "%sQuery billed=%.2f MB  processed=%.2f MB  rows=%d",
-            label, bytes_billed / 1e6, bytes_processed / 1e6, len(df),
+            "%sQuery billed=%.2f MB  processed=%.2f MB  rows=%d  elapsed=%.2fs",
+            label, bytes_billed / 1e6, bytes_processed / 1e6, len(df), elapsed,
         )
         print(
             f"[BQ]{f' {stage_label}' if stage_label else ''} "
             f"billed={bytes_billed/1e6:.2f} MB  "
-            f"processed={bytes_processed/1e6:.2f} MB  rows={len(df)}"
+            f"processed={bytes_processed/1e6:.2f} MB  "
+            f"elapsed={elapsed:.2f}s  rows={len(df)}"
+        )
+        # Log costs for monitoring / cost acceptance-criteria check
+        _log_query_cost(
+            query_name=stage_label or "unknown",
+            bytes_processed=bytes_processed,
+            elapsed_s=elapsed,
         )
         return df
 
     def _fetch_detail(self, text_filter: str) -> pd.DataFrame:
-        """Fetch full detail records including claims text, with fallbacks."""
-        # Attempt 1 — full regex search with claims
+        """Fetch full detail records including claims text, with fallbacks.
+
+        Fallback chain:
+          1. Primary regex on title+abstract (primary cap, full date range)
+          2. Same regex, restricted to filing_date > 2010 (reduces scan size)
+          3. Title-only regex (fallback cap — 5 GB)
+          4. Broad LIKE on title+abstract (fallback cap)
+        """
+        # ── Attempt 1 — full regex, primary cap ──────────────────────────
         try:
-            sql = self._step1_query(
-                text_filter,
-                limit=settings.BQ_QUERY_LIMIT_DETAIL,
-            )
-            print("\n[PatentRetriever] Detail Step 1 query (attempt 1 — regex):\n" + sql)
-            logger.debug("Detail Step 1 query:\n%s", sql)
+            sql = self._step1_query(text_filter, limit=settings.BQ_QUERY_LIMIT_DETAIL)
+            print("\n[PatentRetriever] Detail attempt 1 (regex, primary cap):\n" + sql)
             df = self._run_query(sql, stage_label="detail-regex")
             logger.info("Detail attempt 1 (regex): %d rows", len(df))
             if not df.empty:
                 return df
-            print("[PatentRetriever] attempt 1 returned 0 rows — trying fallback")
+            print("[PatentRetriever] attempt 1 returned 0 rows — fallback")
         except (GoogleAPICallError, Exception) as exc:
-            logger.warning("Detail regex query failed (%s), trying fallback", exc)
-            print(f"[PatentRetriever] attempt 1 FAILED: {exc}")
+            msg = str(exc)
+            if "bytesBilledLimitExceeded" in msg or "exceeds" in msg.lower():
+                print(f"[PatentRetriever] attempt 1 HIT BILLING CAP — trying narrower date window")
+            else:
+                print(f"[PatentRetriever] attempt 1 FAILED: {exc}")
+            logger.warning("Detail regex query failed (%s)", exc)
 
-        # Attempt 2 — extract plain keywords, REGEXP_CONTAINS on abstract.text
+        # ── Attempt 2 — narrower date window (2010+) ─────────────────────
         like_filter = _regex_filter_to_like(text_filter)
-        if like_filter:
-            fallback_filter = f"REGEXP_CONTAINS(abstract.text, r'(?i)({like_filter})')"
-            try:
-                sql2 = self._step1_query(
-                    fallback_filter,
-                    limit=settings.BQ_QUERY_LIMIT_DETAIL,
-                )
-                print("[PatentRetriever] Detail attempt 2 (keyword regex abstract):\n" + sql2)
-                df = self._run_query(sql2, stage_label="detail-kw-abstract")
-                logger.info("Detail attempt 2 (keyword abstract regex): %d rows", len(df))
-                if not df.empty:
-                    return df
-                print("[PatentRetriever] attempt 2 returned 0 rows — trying fallback")
-            except (GoogleAPICallError, Exception) as exc:
-                logger.warning("Detail keyword abstract query failed (%s)", exc)
-                print(f"[PatentRetriever] attempt 2 FAILED: {exc}")
+        try:
+            sql2 = self._step1_query(
+                text_filter,
+                limit=settings.BQ_QUERY_LIMIT_DETAIL,
+                date_cutoff=_DATE_CUTOFF_FB1,
+            )
+            print("[PatentRetriever] Detail attempt 2 (regex, 2010+ date window):\n" + sql2)
+            df = self._run_query(sql2, stage_label="detail-regex-2010", job_config=self._job_config)
+            logger.info("Detail attempt 2 (2010+ window): %d rows", len(df))
+            if not df.empty:
+                return df
+            print("[PatentRetriever] attempt 2 returned 0 rows — fallback")
+        except (GoogleAPICallError, Exception) as exc:
+            logger.warning("Detail 2010+ window query failed (%s)", exc)
+            print(f"[PatentRetriever] attempt 2 FAILED: {exc}")
 
-        # Attempt 3 — title-only keyword regex, no claims (cheapest possible)
+        # ── Attempt 3 — title-only keyword regex, fallback cap ────────────
         if like_filter:
             title_filter = f"REGEXP_CONTAINS(title.text, r'(?i)({like_filter})')"
             try:
@@ -274,18 +361,21 @@ class PatentRetriever:
                     title_filter,
                     limit=settings.BQ_QUERY_LIMIT_DETAIL,
                 )
-                print("[PatentRetriever] Detail attempt 3 (title-only keyword regex):\n" + sql3)
-                df = self._run_query(sql3, stage_label="detail-kw-title")
+                print("[PatentRetriever] Detail attempt 3 (title-only, fallback cap):\n" + sql3)
+                df = self._run_query(
+                    sql3,
+                    stage_label="detail-kw-title",
+                    job_config=self._fallback_job_config,
+                )
                 logger.info("Detail attempt 3 (title keyword regex): %d rows", len(df))
                 if not df.empty:
                     return df
-                print("[PatentRetriever] attempt 3 returned 0 rows — trying LIKE fallback")
+                print("[PatentRetriever] attempt 3 returned 0 rows — LIKE fallback")
             except (GoogleAPICallError, Exception) as exc:
                 logger.warning("Detail title regex query failed (%s)", exc)
                 print(f"[PatentRetriever] attempt 3 FAILED: {exc}")
 
-        # Attempt 4 — guaranteed broad LIKE search on abstract.text + title.text
-        # This ensures the system never returns zero for common technologies.
+        # ── Attempt 4 — broad LIKE on title + abstract, fallback cap ──────
         broad_keywords = _broad_keywords_from_filter(text_filter)
         if broad_keywords:
             abstract_likes = " OR ".join(
@@ -299,9 +389,13 @@ class PatentRetriever:
                 broad_filter,
                 limit=settings.BQ_QUERY_LIMIT_DETAIL,
             )
-            print("[PatentRetriever] Detail attempt 4 (guaranteed LIKE fallback):\n" + sql4)
+            print("[PatentRetriever] Detail attempt 4 (LIKE broad, fallback cap):\n" + sql4)
             try:
-                df = self._run_query(sql4, stage_label="detail-LIKE-broad")
+                df = self._run_query(
+                    sql4,
+                    stage_label="detail-LIKE-broad",
+                    job_config=self._fallback_job_config,
+                )
                 logger.info("Detail attempt 4 (LIKE broad): %d rows", len(df))
                 if not df.empty:
                     return df
@@ -314,10 +408,12 @@ class PatentRetriever:
         return pd.DataFrame()
 
     def _fetch_landscape(self, text_filter: str) -> pd.DataFrame:
-        """Fetch broader landscape set (no claims) with fallbacks."""
-        # Landscape attempt 1 — regex search
-        # IMPORTANT: UNNEST(abstract_localized) is required so text_filter
-        # expressions that reference abstract.text resolve correctly.
+        """Fetch broader landscape set (no claims) with fallbacks.
+
+        Uses a separate, slimmer query (no abstract UNNEST text match needed)
+        so the cost is lower than the detail query.
+        """
+        # ── Attempt 1 — regex search, primary cap ────────────────────────
         landscape_sql = f"""
         SELECT DISTINCT
             publication_number,
@@ -340,7 +436,7 @@ class PatentRetriever:
         ORDER BY publication_date DESC
         LIMIT {settings.BQ_QUERY_LIMIT_LANDSCAPE}
         """
-        print("[PatentRetriever] Landscape attempt 1 (regex) query:\n" + landscape_sql)
+        print("[PatentRetriever] Landscape attempt 1 (regex, primary cap):\n" + landscape_sql)
         try:
             df = self._run_query(landscape_sql, stage_label="landscape-regex")
             logger.info("Landscape attempt 1 (regex): %d rows", len(df))
@@ -348,10 +444,14 @@ class PatentRetriever:
                 return df
             print("[PatentRetriever] landscape attempt 1 returned 0 rows — fallback")
         except (GoogleAPICallError, Exception) as exc:
+            msg = str(exc)
+            if "bytesBilledLimitExceeded" in msg or "exceeds" in msg.lower():
+                print("[PatentRetriever] landscape attempt 1 HIT BILLING CAP — reducing to title-only")
+            else:
+                print(f"[PatentRetriever] landscape attempt 1 FAILED: {exc}")
             logger.warning("Landscape regex query failed (%s)", exc)
-            print(f"[PatentRetriever] landscape attempt 1 FAILED: {exc}")
 
-        # Landscape attempt 2 — title-only keyword regex
+        # ── Attempt 2 — title-only keyword regex, fallback cap ─────────
         like_filter = _regex_filter_to_like(text_filter)
         if like_filter:
             fallback_sql = f"""
@@ -374,9 +474,13 @@ class PatentRetriever:
             ORDER BY publication_date DESC
             LIMIT {settings.BQ_QUERY_LIMIT_LANDSCAPE}
             """
-            print("[PatentRetriever] Landscape attempt 2 (title keyword regex):\n" + fallback_sql)
+            print("[PatentRetriever] Landscape attempt 2 (title keyword regex, fallback cap):\n" + fallback_sql)
             try:
-                df = self._run_query(fallback_sql, stage_label="landscape-kw-title")
+                df = self._run_query(
+                    fallback_sql,
+                    stage_label="landscape-kw-title",
+                    job_config=self._fallback_job_config,
+                )
                 logger.info("Landscape attempt 2 (title keyword regex): %d rows", len(df))
                 if not df.empty:
                     return df
@@ -385,7 +489,7 @@ class PatentRetriever:
                 logger.warning("Landscape keyword title query failed (%s)", exc)
                 print(f"[PatentRetriever] landscape attempt 2 FAILED: {exc}")
 
-        # Landscape attempt 3 — guaranteed broad LIKE on title.text
+        # ── Attempt 3 — broad LIKE on title.text, fallback cap ────────
         broad_keywords = _broad_keywords_from_filter(text_filter)
         if broad_keywords:
             title_likes = " OR ".join(
@@ -400,7 +504,7 @@ class PatentRetriever:
                 publication_date,
                 country_code
             FROM
-                `patents-public-data.patents.publications`,
+                `patents-public-data.patriots.publications`,
                 UNNEST(title_localized) AS title
             WHERE
                 title.language = 'en'
@@ -411,9 +515,18 @@ class PatentRetriever:
             ORDER BY publication_date DESC
             LIMIT {settings.BQ_QUERY_LIMIT_LANDSCAPE}
             """
-            print("[PatentRetriever] Landscape attempt 3 (LIKE broad):\n" + broad_sql)
+            # Fix: correct dataset name
+            broad_sql = broad_sql.replace(
+                "`patents-public-data.patriots.publications`",
+                "`patents-public-data.patents.publications`",
+            )
+            print("[PatentRetriever] Landscape attempt 3 (LIKE broad, fallback cap):\n" + broad_sql)
             try:
-                df = self._run_query(broad_sql, stage_label="landscape-LIKE-broad")
+                df = self._run_query(
+                    broad_sql,
+                    stage_label="landscape-LIKE-broad",
+                    job_config=self._fallback_job_config,
+                )
                 logger.info("Landscape attempt 3 (LIKE broad): %d rows", len(df))
                 if not df.empty:
                     return df

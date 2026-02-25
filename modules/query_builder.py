@@ -17,7 +17,8 @@ from typing import Optional
 from google import genai
 from google.genai import types
 
-from config.prompts import FEATURE_EXTRACTION_PROMPT
+from config.prompts import FEATURE_EXTRACTION_PROMPT, REFORMULATION_PROMPT
+from config import settings
 
 # ---------------------------------------------------------------------------
 # Models to try in order (first available / non-rate-limited wins).
@@ -285,6 +286,110 @@ class QueryBuilder:
         # Temporarily override _MODELS ordering for this call
         raw2 = self._call_gemini_ordered(retry_contents, ordered)
         return self._parse_response(raw2)
+
+    def reformulate_features_for_patent_language(
+        self,
+        features: list[dict],
+    ) -> list[dict]:
+        """
+        Rewrite each feature description into patent-claim-style language
+        using Gemini.
+
+        Args:
+            features: List of feature dicts with at least a ``"description"``
+                      key (as returned by :meth:`extract_features`).
+
+        Returns:
+            The same list with a ``"patent_language"`` key added to each
+            feature.  Falls back to the original description if Gemini fails.
+
+        Each feature dict is returned with an added key::
+
+            {"label": "...", "description": "...", ...,
+             "patent_language": "comprising a foldable solar panel ..."}
+        """
+        if not features:
+            return features
+
+        # Build the prompt input as a JSON array of descriptions
+        descriptions = [
+            {"original": f.get("description", f.get("label", ""))}
+            for f in features
+        ]
+        prompt = REFORMULATION_PROMPT + f"\n\nInput: {json.dumps(descriptions)}"
+
+        raw: str = ""
+        for attempt in range(settings.REFORMULATION_MAX_RETRIES + 1):
+            try:
+                raw = self._call_gemini([prompt])
+                break
+            except Exception as exc:
+                wait = 2 ** attempt
+                print(
+                    f"[QueryBuilder] reformulation Gemini call failed "
+                    f"(attempt {attempt + 1}): {exc}. Retrying in {wait}s..."
+                )
+                time.sleep(wait)
+        else:
+            # All attempts failed — use originals
+            print("[QueryBuilder] Reformulation failed after all retries — using original text")
+            for f in features:
+                if "patent_language" not in f:
+                    f["patent_language"] = f.get("description", "")
+            return features
+
+        # Parse Gemini response — multiple fallback extraction strategies
+        parsed: list | None = None
+        for _try in range(2):
+            try:
+                cleaned = _strip_markdown(raw)
+                # Try direct parse first
+                if cleaned.startswith("["):
+                    parsed = json.loads(cleaned)
+                    break
+                # Try to extract JSON array with regex
+                match = re.search(r"(\[.*\])", raw, re.DOTALL)
+                if match:
+                    parsed = json.loads(match.group(1))
+                    break
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+            if _try == 0:
+                # Retry Gemini with strict instruction
+                strict_prompt = prompt + "\n\nReturn ONLY valid JSON, no other text."
+                try:
+                    raw = self._call_gemini([strict_prompt])
+                except Exception:
+                    break
+
+        if not parsed or not isinstance(parsed, list):
+            print(
+                "[QueryBuilder] Reformulation: could not parse Gemini response — "
+                "falling back to original descriptions"
+            )
+            for f in features:
+                if "patent_language" not in f:
+                    f["patent_language"] = f.get("description", "")
+            return features
+
+        # Apply reformulations
+        # Build a lookup: original description → patent_language
+        remap: dict[str, str] = {}
+        for item in parsed:
+            if isinstance(item, dict) and "patent_language" in item:
+                orig = item.get("original", "")
+                remap[orig] = item["patent_language"]
+
+        for f in features:
+            desc = f.get("description", "")
+            f["patent_language"] = remap.get(desc, desc)
+
+        print(
+            f"[QueryBuilder] Reformulated {len([f for f in features if f.get('patent_language')])} "
+            f"features into patent language."
+        )
+        return features
 
     def build_bigquery_where_clause(self, search_strategy: dict) -> dict:
         """

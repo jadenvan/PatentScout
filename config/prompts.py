@@ -177,3 +177,19 @@ Rules:
 6. "plain_english" must be a single sentence a non-expert can understand.
 7. Return ONLY the JSON array.  No commentary before or after.
 """
+
+# ---------------------------------------------------------------------------
+# Feature Reformulation — rewrite natural-language features as patent claims
+# ---------------------------------------------------------------------------
+REFORMULATION_PROMPT = """\
+You are a patent-language rewriter. Given a JSON array of short feature
+descriptions, rewrite each as a concise (10-25 words) patent-claim-style
+phrase using formal patent vocabulary (e.g., "comprising", "disposed on",
+"configured to", "wherein"). Preserve technical meaning exactly.
+
+Return ONLY valid JSON — no markdown fences, no prose, no explanation.
+First character must be '[', last character must be ']'.
+
+Format:
+[{"original": "...", "patent_language": "..."}]
+"""
