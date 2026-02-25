@@ -154,9 +154,59 @@ TABLE_BODY_STYLE = [
 
 BASE_TABLE_STYLE = TABLE_HEADER_STYLE + TABLE_BODY_STYLE
 
+# ---------------------------------------------------------------------------
+# Additional paragraph styles for match-detail pages
+# ---------------------------------------------------------------------------
+mono_style = ParagraphStyle(
+    'PSMono',
+    parent=_base['Normal'],
+    textColor=SECONDARY,
+    fontSize=9,
+    leading=12,
+    spaceAfter=4,
+    fontName='Courier',
+)
+
+small_bold = ParagraphStyle(
+    'PSSmallBold',
+    parent=_base['Normal'],
+    textColor=PRIMARY,
+    fontSize=9,
+    leading=12,
+    spaceAfter=2,
+    fontName='Helvetica-Bold',
+)
+
+feature_header_style = ParagraphStyle(
+    'PSFeatureHeader',
+    parent=_base['Heading2'],
+    textColor=ACCENT,
+    fontSize=13,
+    leading=17,
+    spaceBefore=10,
+    spaceAfter=4,
+    fontName='Helvetica-Bold',
+)
+
+recommendation_style = ParagraphStyle(
+    'PSRecommendation',
+    parent=_base['Normal'],
+    textColor=PRIMARY,
+    fontSize=10,
+    leading=14,
+    spaceBefore=6,
+    spaceAfter=4,
+    fontName='Helvetica-BoldOblique',
+    leftIndent=8,
+)
+
 # Row background colours keyed by similarity/confidence level
 CONF_COLORS = {
     'HIGH':     HexColor('#FDECEA'),
     'MODERATE': HexColor('#FEF9E7'),
     'LOW':      HexColor('#EAF9EA'),
 }
+
+# Bar / badge colours for score visualisation
+SCORE_BAR_FG = ACCENT
+SCORE_BAR_BG = HexColor('#E0E0E0')
