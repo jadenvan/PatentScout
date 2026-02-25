@@ -95,26 +95,40 @@ def _sanitize_regex(pattern: str) -> str:
 
     Strategy:
     1. Validate the regex compiles (fix if not).
-    2. Count alternation branches inside the outermost group.  If there are
-       more than 7, keep only the first 7 shortest non-empty branches so the
-       pattern stays selective without being excessively long.
-    3. Return a clean ``(?i)(tok1|tok2|...)`` pattern.
-
-    This prevents Gemini from generating patterns like
-    ``(?i)(solar|photovoltaic|pv|...)`` with 20+ branches that cause regex
-    engine timeouts or BigQuery slot exhaustion.
+    2. Extract word tokens ≥ 4 chars from the pattern.
+    3. Remove ultra-common stopwords that match too broadly (power, system, type,
+       energy, unit, etc.) — these cause 200+ GB scans by matching every patent.
+    4. Keep up to 7 of the most *domain-specific* tokens (prefer longer words
+       over short ones, since short words tend to be generic).
+    5. Return a clean ``(?i)(tok1|tok2|...)`` pattern.
     """
     pattern = _validate_regex(pattern)
+
+    # Ultra-common tokens that match virtually every patent abstract
+    _STOPWORDS = {
+        "type", "port", "power", "energy", "unit", "system", "method",
+        "device", "apparatus", "comprising", "plurality", "portion",
+        "structure", "module", "assembly", "element", "member", "means",
+        "first", "second", "surface", "base", "body", "form", "output",
+        "input", "provide", "include", "connect", "support", "data",
+        "signal", "process", "control", "layer", "material", "component",
+    }
 
     # Extract all 4+ letter words from the pattern as the token pool
     words = list(dict.fromkeys(
         w.lower() for w in re.findall(r"[a-zA-Z]{4,}", pattern)
+        if w.lower() not in _STOPWORDS
     ))
+    if not words:
+        # Fallback: if all words were stopwords, pick original words
+        words = list(dict.fromkeys(
+            w.lower() for w in re.findall(r"[a-zA-Z]{4,}", pattern)
+        ))
     if not words:
         return pattern
 
-    # Cap at 7 shortest tokens to keep the alternation lean
-    words = sorted(words, key=len)[:7]
+    # Prefer LONGER tokens (more domain-specific) — take up to 7
+    words = sorted(words, key=len, reverse=True)[:7]
     return "(?i)(" + "|".join(words) + ")"
 
 
@@ -396,13 +410,14 @@ class QueryBuilder:
         Build BigQuery WHERE clause fragments from a feature-extraction strategy.
 
         Combines all ``bigquery_regex`` patterns with OR into a text filter,
-        and builds a CPC LIKE clause from the predicted ``cpc_codes``.
+        and builds a CPC EXISTS clause from the predicted ``cpc_codes``.
 
         Args:
             search_strategy: Dict returned by :meth:`extract_features`.
 
         Returns:
-            Dict with keys ``text_filter``, ``cpc_filter``, and ``combined``.
+            Dict with keys ``text_filter``, ``cpc_filter``, ``cpc_prefixes``,
+            and ``combined``.
         """
         search_terms = search_strategy.get("search_terms", [])
         cpc_codes = search_strategy.get("cpc_codes", [])
@@ -412,7 +427,7 @@ class QueryBuilder:
         for term in search_terms:
             pattern = term.get("bigquery_regex", "")
             if pattern:
-                # Sanitize: validate + cap alternations to 7 core tokens
+                # Sanitize: validate + cap alternations to 7 domain-specific tokens
                 pattern = _sanitize_regex(pattern)
                 safe_pattern = pattern.replace("'", "\\'")
                 # Use abstract.text (the scalar field from the UNNEST alias)
@@ -425,16 +440,24 @@ class QueryBuilder:
         else:
             text_filter = "TRUE  -- no text patterns generated"
 
-        # --- CPC filter ----------------------------------------------------
-        cpc_clauses: list[str] = []
+        # --- CPC filter (for EXISTS sub-query) ----------------------------
+        cpc_prefixes: list[str] = []
+        cpc_like_clauses: list[str] = []
         for cpc in cpc_codes:
             code = cpc.get("code", "").strip()
             if code:
+                # Use the top-level group (e.g. H02S, H02J7 → H02S%, H02J%)
                 prefix = re.split(r"[/.]", code)[0]
-                cpc_clauses.append(f"cpc_item.code LIKE '{prefix}%'")
+                if prefix and prefix not in cpc_prefixes:
+                    cpc_prefixes.append(prefix)
+                    cpc_like_clauses.append(f"c.code LIKE '{prefix}%'")
 
-        if cpc_clauses:
-            cpc_filter = "(\n  " + "\n  OR ".join(cpc_clauses) + "\n)"
+        if cpc_like_clauses:
+            cpc_filter = (
+                "EXISTS (SELECT 1 FROM UNNEST(cpc) AS c WHERE\n    "
+                + "\n    OR ".join(cpc_like_clauses)
+                + "\n  )"
+            )
         else:
             cpc_filter = "TRUE  -- no CPC codes predicted"
 
@@ -443,5 +466,6 @@ class QueryBuilder:
         return {
             "text_filter": text_filter,
             "cpc_filter": cpc_filter,
+            "cpc_prefixes": cpc_prefixes,
             "combined": combined,
         }

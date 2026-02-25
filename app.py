@@ -327,7 +327,7 @@ def _render_results() -> None:
                 pub_num  = row.get("publication_number", "")
                 url       = row.get("patent_url", "#")
                 title_txt = row.get("title", "Untitled")
-                abstract  = row.get("abstract", "No abstract available.")
+                abstract  = row.get("abstract") or "No abstract available (title-only retrieval)."
                 with st.expander(f"{pub_num} — {title_txt[:80]}"):
                     st.markdown(f"**[Open on Google Patents ↗]({url})**")
                     st.write(abstract)

@@ -6,16 +6,16 @@ and returns normalised DataFrames for the Prior Art and Landscape tabs.
 
 Design notes
 ------------
-* Two-stage approach to minimise bytes scanned:
-    Stage 1 — title + abstract text search → list of publication_numbers
-    Stage 2 — targeted IN-list queries for CPC, assignees, and claims
-* Every BigQuery job is capped at BQ_MAX_BYTES_BILLED (default 20 GB).
-* If a job exceeds the cap an automatic fallback chain runs:
-    Fallback 1: restrict filing_date window (>2010-01-01) — same cap
-    Fallback 2: title-only search at BQ_FALLBACK_BYTES_BILLED (5 GB)
+* Two-phase approach to minimise bytes scanned:
+    Phase 1 — CPC-filtered scout: pub_numbers + dates + CPC/assignee (~22 GB)
+    Phase 2 — Title fetch for matched patents via IN-list (~19 GB)
+    Phase 3 — Python-side text regex filter on titles (0 GB)
+* Abstract is NOT fetched from BQ (~202 GB column). Embedding uses titles.
+* Claims are optionally fetched with a separate high cap (~123 GB) and
+  are skipped gracefully if too expensive.
 * Per-query bytes processed and elapsed time are appended to
   .tmp/query_costs.json and to st.session_state['query_costs'] when
-  Streamlit is active (non-blocking — failures are silently suppressed).
+  Streamlit is active (non-blocking — failures silently suppressed).
 """
 
 from __future__ import annotations
@@ -36,8 +36,15 @@ from config import settings
 logger = logging.getLogger(__name__)
 
 # Alternative cutoff used in fallback #1 (filing_date > 2010)
-_DATE_CUTOFF      = 20000101   # primary
+_DATE_CUTOFF      = settings.BQ_MIN_FILING_DATE   # primary (from settings)
 _DATE_CUTOFF_FB1  = 20100101   # fallback #1 — narrower date window
+_DATE_CUTOFF_FB2  = 20150101   # fallback #2 — even narrower
+
+# Solar-domain keywords for sanity checks (case-insensitive)
+_SOLAR_KEYWORDS = [
+    "solar", "photovoltaic", "charger", "battery", "usb",
+    "power bank", "portable", "foldable",
+]
 
 
 # ---------------------------------------------------------------------------
@@ -137,133 +144,266 @@ class PatentRetriever:
         self, search_strategy: dict
     ) -> tuple[pd.DataFrame, pd.DataFrame]:
         """
-        Run detail + landscape queries and return (detail_df, landscape_df).
+        Two-phase retrieval: CPC scout → title fetch → Python filter.
 
-        Args:
-            search_strategy: Dict produced by QueryBuilder that must contain
-                             a ``text_filter`` key with a BigQuery-ready
-                             WHERE expression string.
+        Phase 1 (CPC Scout, ~22 GB): publication_numbers + dates +
+            aggregated CPC codes & assignee names, filtered by CPC EXISTS.
+        Phase 2 (Title Fetch, ~19 GB): English titles for matched patents.
+        Phase 3 (Python, 0 GB): Apply text regex from ``text_filter`` to
+            titles locally.  Split results into detail (top N) and
+            landscape (remaining).
 
         Returns:
             ``(detail_df, landscape_df)`` — both enriched with cpc_code lists,
             assignee_name lists, parsed date strings, relevance scores, and
             Google Patents URLs.
         """
-        text_filter = search_strategy.get("text_filter", "TRUE")
-        # ── Debug: always print the filter so we can inspect it in the terminal
+        text_filter  = search_strategy.get("text_filter", "TRUE")
+        cpc_filter   = search_strategy.get("cpc_filter", "")
+        cpc_prefixes = search_strategy.get("cpc_prefixes", [])
+
+        # Build CPC filter from cpc_codes if not pre-built
+        if not cpc_filter or cpc_filter.startswith("TRUE"):
+            cpc_prefixes = self._extract_cpc_prefixes(search_strategy)
+            cpc_filter = self._build_cpc_exists_clause(cpc_prefixes)
+
         print("\n" + "=" * 72)
         print("[PatentRetriever] text_filter:\n" + text_filter)
+        print("[PatentRetriever] cpc_filter:\n" + cpc_filter)
         print("=" * 72 + "\n")
         logger.debug("text_filter:\n%s", text_filter)
+        logger.debug("cpc_filter:\n%s", cpc_filter)
+
+        # Save for diagnostics
+        try:
+            import streamlit as st
+            st.session_state["last_text_filter"] = text_filter
+            st.session_state["last_cpc_filter"]  = cpc_filter
+        except Exception:
+            pass
 
         predicted_cpc = [
             c.get("code", "") for c in search_strategy.get("cpc_codes", [])
         ]
 
-        # -- Detail patents -----------------------------------------------
-        detail_df = self._fetch_detail(text_filter)
-        detail_df = self._enrich_with_metadata(detail_df, fetch_claims=True)
+        # ── Phase 1: CPC Scout ──────────────────────────────────────────
+        scout_df = self._cpc_scout(cpc_filter)
+        if scout_df.empty:
+            logger.warning("CPC scout returned 0 rows — returning empty")
+            empty = pd.DataFrame()
+            return empty, empty
+
+        # ── Phase 2: Title Fetch ────────────────────────────────────────
+        pub_numbers = scout_df["publication_number"].tolist()
+        try:
+            title_df = self._run_query(
+                self._title_query(pub_numbers), stage_label="title-fetch",
+            )
+            if not title_df.empty:
+                scout_df = scout_df.merge(title_df, on="publication_number", how="left")
+        except (GoogleAPICallError, Exception) as exc:
+            logger.warning("Title fetch failed (%s)", exc)
+            print(f"[PatentRetriever] title fetch FAILED: {exc}")
+        if "title" not in scout_df.columns:
+            scout_df["title"] = ""
+
+        # ── Parse CPC/assignee aggregation ──────────────────────────────
+        self._parse_scout_aggregations(scout_df)
+
+        # ── Phase 3: Python text filter on titles ───────────────────────
+        filtered_df = self._python_text_filter(scout_df, text_filter)
+        n_before, n_after = len(scout_df), len(filtered_df)
+        print(f"  Text filter: {n_after}/{n_before} rows passed")
+
+        # If text filter removed too many, relax to CPC-only
+        if n_after < 5 and n_before >= 5:
+            print("  Text filter too strict — using CPC-only results")
+            filtered_df = scout_df
+
+        # Relevance sanity check
+        frac = self._check_relevance(filtered_df)
+        print(f"  Relevance: {frac:.1%} ({len(filtered_df)} rows)")
+
+        # Abstract not fetched from BQ (too expensive at 202 GB)
+        if "abstract" not in filtered_df.columns:
+            filtered_df["abstract"] = ""
+
+        # Sort by publication_date DESC
+        if "publication_date" in filtered_df.columns:
+            filtered_df = filtered_df.sort_values("publication_date", ascending=False)
+        filtered_df = filtered_df.reset_index(drop=True)
+
+        # ── Split into detail + landscape ───────────────────────────────
+        detail_limit = settings.BQ_QUERY_LIMIT_DETAIL
+        detail_df    = filtered_df.head(detail_limit).copy()
+        landscape_df = filtered_df.iloc[detail_limit:].copy().reset_index(drop=True)
+
+        # Ensure claims_text column exists (may be fetched later)
+        if "claims_text" not in detail_df.columns:
+            detail_df["claims_text"] = ""
+        if "claims_text" not in landscape_df.columns:
+            landscape_df["claims_text"] = ""
+
+        # ── Post-processing ─────────────────────────────────────────────
         self._add_computed_columns(detail_df)
         self._score_relevance(detail_df, predicted_cpc, search_strategy)
-
-        # -- Landscape patents --------------------------------------------
-        landscape_df = self._fetch_landscape(text_filter)
-        landscape_df = self._enrich_with_metadata(landscape_df, fetch_claims=False)
         self._add_computed_columns(landscape_df)
+
+        # ── Optional: Fetch claims for top detail patents ───────────────
+        if not detail_df.empty:
+            self._try_fetch_claims(detail_df)
 
         logger.info(
             "PatentRetriever: detail=%d rows  landscape=%d rows",
-            len(detail_df),
-            len(landscape_df),
+            len(detail_df), len(landscape_df),
         )
         return detail_df, landscape_df
+
+    # ------------------------------------------------------------------
+    # CPC helpers
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _extract_cpc_prefixes(search_strategy: dict) -> list[str]:
+        """Extract unique CPC group prefixes from search_strategy['cpc_codes']."""
+        prefixes: list[str] = []
+        for cpc in search_strategy.get("cpc_codes", []):
+            code = cpc.get("code", "").strip()
+            if code:
+                prefix = re.split(r"[/.]", code)[0]
+                if prefix and prefix not in prefixes:
+                    prefixes.append(prefix)
+        return prefixes
+
+    @staticmethod
+    def _build_cpc_exists_clause(cpc_prefixes: list[str]) -> str:
+        """Build a BigQuery EXISTS(SELECT 1 FROM UNNEST(cpc)...) clause."""
+        if not cpc_prefixes:
+            return ""
+        likes = [f"c.code LIKE '{p}%'" for p in cpc_prefixes]
+        return (
+            "EXISTS (SELECT 1 FROM UNNEST(cpc) AS c WHERE\n      "
+            + "\n      OR ".join(likes)
+            + "\n    )"
+        )
+
+    @staticmethod
+    def _check_relevance(
+        df: pd.DataFrame,
+        keywords: list[str] | None = None,
+    ) -> float:
+        """Return the fraction of rows whose title or abstract contains
+        at least one keyword from *keywords* (case-insensitive).
+
+        Handles both pre-rename (pub_title/pub_abstract) and post-rename
+        (title/abstract) column names.
+        """
+        if df.empty:
+            return 0.0
+        if keywords is None:
+            keywords = _SOLAR_KEYWORDS
+        # Support both column naming conventions
+        title_col = "pub_title" if "pub_title" in df.columns else "title"
+        abs_col = "pub_abstract" if "pub_abstract" in df.columns else "abstract"
+        hits = 0
+        for _, row in df.iterrows():
+            text = (str(row.get(title_col, "")) + " " + str(row.get(abs_col, ""))).lower()
+            if any(kw in text for kw in keywords):
+                hits += 1
+        return hits / len(df)
 
     # ------------------------------------------------------------------
     # Query builders
     # ------------------------------------------------------------------
 
-    def _step1_query(
+    def _cpc_scout_query(
         self,
-        text_filter: str,
-        limit: int,
-        include_claims: bool = False,  # always ignored — claims fetched in Step 2
+        cpc_filter: str,
+        limit: int = 500,
         date_cutoff: int = _DATE_CUTOFF,
     ) -> str:
-        """Return a BigQuery SQL for the first step (core patent fields).
+        """Phase 1 SQL: CPC-filtered patent discovery.
 
-        Claims are intentionally excluded here: UNNEST(claims_localized) on the
-        full publications table costs ~350 GB per query.  Claims are fetched
-        cheaply in a targeted Step-2 query once we have a short patent list.
-
-        Args:
-            date_cutoff: integer YYYYMMDD lower bound for filing_date.  Using a
-                         more recent cutoff (e.g. 20100101) is the primary
-                         mechanism for reducing bytes scanned when the full
-                         range query hits the billing cap.
+        Scans ~22 GB (publication_number + dates + cpc.code + assignee.name).
+        Does NOT access title_localized or abstract_localized.
+        Includes STRING_AGG for CPC codes and assignees so no separate
+        metadata query is needed.
         """
+        cpc_clause = f"AND {cpc_filter}" if cpc_filter else ""
         return f"""
-        SELECT DISTINCT
+        SELECT
             publication_number,
-            title.text    AS title,
-            abstract.text AS abstract,
             filing_date,
             grant_date,
             publication_date,
             country_code,
-            family_id
-        FROM
-            `patents-public-data.patents.publications`,
-            UNNEST(title_localized)    AS title,
-            UNNEST(abstract_localized) AS abstract
-        WHERE
-            title.language    = 'en'
-            AND abstract.language = 'en'
-            AND country_code  = 'US'
-            AND grant_date    > 0
-            AND filing_date   > {date_cutoff}
-            AND ({text_filter})
+            family_id,
+            (SELECT STRING_AGG(c.code, ' | ') FROM UNNEST(cpc) c) AS cpc_codes_agg,
+            (SELECT STRING_AGG(a.name, ' | ') FROM UNNEST(assignee_harmonized) a) AS assignees_agg
+        FROM `patents-public-data.patents.publications`
+        WHERE country_code = 'US'
+          AND grant_date > 0
+          AND filing_date > {date_cutoff}
+          {cpc_clause}
         ORDER BY publication_date DESC
         LIMIT {limit}
         """
 
+    def _title_query(self, publication_numbers: list[str]) -> str:
+        """Phase 2 SQL: Fetch English titles for specific patents (~19 GB).
+
+        Uses IN-list filtering on publication_number.  Only reads the
+        publication_number and title_localized columns.
+        """
+        in_list = ", ".join(f"'{p}'" for p in publication_numbers)
+        return f"""
+        SELECT
+            publication_number,
+            (SELECT t.text FROM UNNEST(title_localized) t
+             WHERE t.language = 'en' LIMIT 1) AS title
+        FROM `patents-public-data.patents.publications`
+        WHERE publication_number IN ({in_list})
+        """
+
     def _meta_query(self, publication_numbers: list[str]) -> str:
-        """Return SQL that fetches CPC codes + assignees for given patents."""
+        """Return SQL that fetches CPC codes + assignees for given patents.
+
+        Uses separate ARRAY subqueries instead of UNNEST cross-join so that
+        rows with N assignees × M CPC codes aren't duplicated N×M times.
+        """
         patents_in = ", ".join(f"'{p}'" for p in publication_numbers)
         return f"""
         SELECT
             publication_number,
-            assignee.name AS assignee_name,
-            cpc.code      AS cpc_code
+            (SELECT STRING_AGG(a.name, ' | ') FROM UNNEST(assignee_harmonized) a) AS assignee_name,
+            (SELECT STRING_AGG(c.code, ' | ') FROM UNNEST(cpc) c)                AS cpc_code
         FROM
-            `patents-public-data.patents.publications`,
-            UNNEST(assignee_harmonized) AS assignee,
-            UNNEST(cpc) AS cpc
+            `patents-public-data.patents.publications`
         WHERE
             publication_number IN ({patents_in})
         """
 
     def _claims_query(self, publication_numbers: list[str]) -> str:
-        """Return SQL that fetches English claims text for a short list of patents.
+        """Return SQL that fetches English claims text.
 
-        This is cheap because it is filtered to a small IN-list of specific
-        publication_numbers rather than scanning the full table.
+        WARNING: Scans ~123 GB (claims_localized column) regardless of
+        IN-list size.  Use with a high billing cap or skip if too expensive.
         """
         patents_in = ", ".join(f"'{p}'" for p in publication_numbers)
         return f"""
         SELECT
             publication_number,
-            STRING_AGG(claims.text, ' | ' ORDER BY claims.text) AS claims_text
+            (SELECT STRING_AGG(c.text, ' | ')
+             FROM UNNEST(claims_localized) c
+             WHERE c.language = 'en') AS claims_text
         FROM
-            `patents-public-data.patents.publications`,
-            UNNEST(claims_localized) AS claims
+            `patents-public-data.patents.publications`
         WHERE
             publication_number IN ({patents_in})
-            AND claims.language = 'en'
-        GROUP BY publication_number
         """
 
     # ------------------------------------------------------------------
-    # Fetch helpers
+    # Core query runner
     # ------------------------------------------------------------------
 
     def _run_query(
@@ -301,7 +441,6 @@ class PatentRetriever:
             f"processed={bytes_processed/1e6:.2f} MB  "
             f"elapsed={elapsed:.2f}s  rows={len(df)}"
         )
-        # Log costs for monitoring / cost acceptance-criteria check
         _log_query_cost(
             query_name=stage_label or "unknown",
             bytes_processed=bytes_processed,
@@ -309,303 +448,122 @@ class PatentRetriever:
         )
         return df
 
-    def _fetch_detail(self, text_filter: str) -> pd.DataFrame:
-        """Fetch full detail records including claims text, with fallbacks.
+    # ------------------------------------------------------------------
+    # Fetch orchestrators
+    # ------------------------------------------------------------------
 
-        Fallback chain:
-          1. Primary regex on title+abstract (primary cap, full date range)
-          2. Same regex, restricted to filing_date > 2010 (reduces scan size)
-          3. Title-only regex (fallback cap — 5 GB)
-          4. Broad LIKE on title+abstract (fallback cap)
+    def _cpc_scout(self, cpc_filter: str) -> pd.DataFrame:
+        """Run CPC scout with date-fallback chain.
+
+        Attempts:
+          1. Full date range (filing_date > settings.BQ_MIN_FILING_DATE)
+          2. 2010+ date window
+          3. 2015+ date window
         """
-        # ── Attempt 1 — full regex, primary cap ──────────────────────────
-        try:
-            sql = self._step1_query(text_filter, limit=settings.BQ_QUERY_LIMIT_DETAIL)
-            print("\n[PatentRetriever] Detail attempt 1 (regex, primary cap):\n" + sql)
-            df = self._run_query(sql, stage_label="detail-regex")
-            logger.info("Detail attempt 1 (regex): %d rows", len(df))
-            if not df.empty:
-                return df
-            print("[PatentRetriever] attempt 1 returned 0 rows — fallback")
-        except (GoogleAPICallError, Exception) as exc:
-            msg = str(exc)
-            if "bytesBilledLimitExceeded" in msg or "exceeds" in msg.lower():
-                print(f"[PatentRetriever] attempt 1 HIT BILLING CAP — trying narrower date window")
-            else:
-                print(f"[PatentRetriever] attempt 1 FAILED: {exc}")
-            logger.warning("Detail regex query failed (%s)", exc)
-
-        # ── Attempt 2 — narrower date window (2010+) ─────────────────────
-        like_filter = _regex_filter_to_like(text_filter)
-        try:
-            sql2 = self._step1_query(
-                text_filter,
-                limit=settings.BQ_QUERY_LIMIT_DETAIL,
-                date_cutoff=_DATE_CUTOFF_FB1,
-            )
-            print("[PatentRetriever] Detail attempt 2 (regex, 2010+ date window):\n" + sql2)
-            df = self._run_query(sql2, stage_label="detail-regex-2010", job_config=self._job_config)
-            logger.info("Detail attempt 2 (2010+ window): %d rows", len(df))
-            if not df.empty:
-                return df
-            print("[PatentRetriever] attempt 2 returned 0 rows — fallback")
-        except (GoogleAPICallError, Exception) as exc:
-            logger.warning("Detail 2010+ window query failed (%s)", exc)
-            print(f"[PatentRetriever] attempt 2 FAILED: {exc}")
-
-        # ── Attempt 3 — title-only keyword regex, fallback cap ────────────
-        if like_filter:
-            title_filter = f"REGEXP_CONTAINS(title.text, r'(?i)({like_filter})')"
+        for attempt, cutoff in enumerate(
+            [_DATE_CUTOFF, _DATE_CUTOFF_FB1, _DATE_CUTOFF_FB2], 1
+        ):
             try:
-                sql3 = self._step1_query(
-                    title_filter,
-                    limit=settings.BQ_QUERY_LIMIT_DETAIL,
-                )
-                print("[PatentRetriever] Detail attempt 3 (title-only, fallback cap):\n" + sql3)
-                df = self._run_query(
-                    sql3,
-                    stage_label="detail-kw-title",
-                    job_config=self._fallback_job_config,
-                )
-                logger.info("Detail attempt 3 (title keyword regex): %d rows", len(df))
+                sql = self._cpc_scout_query(cpc_filter, date_cutoff=cutoff)
+                print(f"[PatentRetriever] CPC scout attempt {attempt} (date>{cutoff})")
+                df = self._run_query(sql, stage_label=f"cpc-scout-{attempt}")
                 if not df.empty:
+                    print(f"  Scout: {len(df)} CPC-matched patents")
                     return df
-                print("[PatentRetriever] attempt 3 returned 0 rows — LIKE fallback")
+                print(f"  Scout returned 0 rows — tightening date")
             except (GoogleAPICallError, Exception) as exc:
-                logger.warning("Detail title regex query failed (%s)", exc)
-                print(f"[PatentRetriever] attempt 3 FAILED: {exc}")
+                msg = str(exc)
+                if "bytesBilledLimitExceeded" in msg:
+                    print(f"[PatentRetriever] scout {attempt} HIT BILLING CAP")
+                else:
+                    print(f"[PatentRetriever] scout {attempt} FAILED: {exc}")
+                logger.warning("Scout attempt %d failed: %s", attempt, exc)
 
-        # ── Attempt 4 — broad LIKE on title + abstract, fallback cap ──────
-        broad_keywords = _broad_keywords_from_filter(text_filter)
-        if broad_keywords:
-            abstract_likes = " OR ".join(
-                f"abstract.text LIKE '%{kw}%'" for kw in broad_keywords
-            )
-            title_likes = " OR ".join(
-                f"title.text LIKE '%{kw}%'" for kw in broad_keywords
-            )
-            broad_filter = f"(({abstract_likes}) OR ({title_likes}))"
-            sql4 = self._step1_query(
-                broad_filter,
-                limit=settings.BQ_QUERY_LIMIT_DETAIL,
-            )
-            print("[PatentRetriever] Detail attempt 4 (LIKE broad, fallback cap):\n" + sql4)
-            try:
-                df = self._run_query(
-                    sql4,
-                    stage_label="detail-LIKE-broad",
-                    job_config=self._fallback_job_config,
-                )
-                logger.info("Detail attempt 4 (LIKE broad): %d rows", len(df))
-                if not df.empty:
-                    return df
-                print("[PatentRetriever] attempt 4 returned 0 rows")
-            except (GoogleAPICallError, Exception) as exc:
-                logger.warning("Detail LIKE broad query failed (%s)", exc)
-                print(f"[PatentRetriever] attempt 4 FAILED: {exc}")
-
-        logger.warning("All detail query attempts returned 0 rows for filter: %s", text_filter)
+        logger.warning("All CPC scout attempts returned 0 rows")
         return pd.DataFrame()
 
-    def _fetch_landscape(self, text_filter: str) -> pd.DataFrame:
-        """Fetch broader landscape set (no claims) with fallbacks.
+    def _try_fetch_claims(self, df: pd.DataFrame) -> None:
+        """Attempt to fetch claims for patents in *df* (in-place).
 
-        Uses a separate, slimmer query (no abstract UNNEST text match needed)
-        so the cost is lower than the detail query.
-        """
-        # ── Attempt 1 — regex search, primary cap ────────────────────────
-        landscape_sql = f"""
-        SELECT DISTINCT
-            publication_number,
-            title.text   AS title,
-            filing_date,
-            grant_date,
-            publication_date,
-            country_code
-        FROM
-            `patents-public-data.patents.publications`,
-            UNNEST(title_localized)    AS title,
-            UNNEST(abstract_localized) AS abstract
-        WHERE
-            title.language    = 'en'
-            AND abstract.language = 'en'
-            AND country_code  = 'US'
-            AND grant_date    > 0
-            AND filing_date   > {_DATE_CUTOFF}
-            AND ({text_filter})
-        ORDER BY publication_date DESC
-        LIMIT {settings.BQ_QUERY_LIMIT_LANDSCAPE}
-        """
-        print("[PatentRetriever] Landscape attempt 1 (regex, primary cap):\n" + landscape_sql)
-        try:
-            df = self._run_query(landscape_sql, stage_label="landscape-regex")
-            logger.info("Landscape attempt 1 (regex): %d rows", len(df))
-            if not df.empty:
-                return df
-            print("[PatentRetriever] landscape attempt 1 returned 0 rows — fallback")
-        except (GoogleAPICallError, Exception) as exc:
-            msg = str(exc)
-            if "bytesBilledLimitExceeded" in msg or "exceeds" in msg.lower():
-                print("[PatentRetriever] landscape attempt 1 HIT BILLING CAP — reducing to title-only")
-            else:
-                print(f"[PatentRetriever] landscape attempt 1 FAILED: {exc}")
-            logger.warning("Landscape regex query failed (%s)", exc)
-
-        # ── Attempt 2 — title-only keyword regex, fallback cap ─────────
-        like_filter = _regex_filter_to_like(text_filter)
-        if like_filter:
-            fallback_sql = f"""
-            SELECT DISTINCT
-                publication_number,
-                title.text   AS title,
-                filing_date,
-                grant_date,
-                publication_date,
-                country_code
-            FROM
-                `patents-public-data.patents.publications`,
-                UNNEST(title_localized) AS title
-            WHERE
-                title.language = 'en'
-                AND country_code = 'US'
-                AND grant_date   > 0
-                AND filing_date  > {_DATE_CUTOFF}
-                AND REGEXP_CONTAINS(title.text, r'(?i)({like_filter})')
-            ORDER BY publication_date DESC
-            LIMIT {settings.BQ_QUERY_LIMIT_LANDSCAPE}
-            """
-            print("[PatentRetriever] Landscape attempt 2 (title keyword regex, fallback cap):\n" + fallback_sql)
-            try:
-                df = self._run_query(
-                    fallback_sql,
-                    stage_label="landscape-kw-title",
-                    job_config=self._fallback_job_config,
-                )
-                logger.info("Landscape attempt 2 (title keyword regex): %d rows", len(df))
-                if not df.empty:
-                    return df
-                print("[PatentRetriever] landscape attempt 2 returned 0 rows — LIKE fallback")
-            except (GoogleAPICallError, Exception) as exc:
-                logger.warning("Landscape keyword title query failed (%s)", exc)
-                print(f"[PatentRetriever] landscape attempt 2 FAILED: {exc}")
-
-        # ── Attempt 3 — broad LIKE on title.text, fallback cap ────────
-        broad_keywords = _broad_keywords_from_filter(text_filter)
-        if broad_keywords:
-            title_likes = " OR ".join(
-                f"title.text LIKE '%{kw}%'" for kw in broad_keywords
-            )
-            broad_sql = f"""
-            SELECT DISTINCT
-                publication_number,
-                title.text   AS title,
-                filing_date,
-                grant_date,
-                publication_date,
-                country_code
-            FROM
-                `patents-public-data.patriots.publications`,
-                UNNEST(title_localized) AS title
-            WHERE
-                title.language = 'en'
-                AND country_code = 'US'
-                AND grant_date   > 0
-                AND filing_date  > {_DATE_CUTOFF}
-                AND ({title_likes})
-            ORDER BY publication_date DESC
-            LIMIT {settings.BQ_QUERY_LIMIT_LANDSCAPE}
-            """
-            # Fix: correct dataset name
-            broad_sql = broad_sql.replace(
-                "`patents-public-data.patriots.publications`",
-                "`patents-public-data.patents.publications`",
-            )
-            print("[PatentRetriever] Landscape attempt 3 (LIKE broad, fallback cap):\n" + broad_sql)
-            try:
-                df = self._run_query(
-                    broad_sql,
-                    stage_label="landscape-LIKE-broad",
-                    job_config=self._fallback_job_config,
-                )
-                logger.info("Landscape attempt 3 (LIKE broad): %d rows", len(df))
-                if not df.empty:
-                    return df
-                print("[PatentRetriever] landscape attempt 3 returned 0 rows")
-            except (GoogleAPICallError, Exception) as exc:
-                logger.warning("Landscape LIKE broad query failed (%s)", exc)
-                print(f"[PatentRetriever] landscape attempt 3 FAILED: {exc}")
-
-        logger.warning("All landscape query attempts returned 0 rows for filter: %s", text_filter)
-        return pd.DataFrame()
-
-    def _enrich_with_metadata(
-        self, df: pd.DataFrame, fetch_claims: bool = False
-    ) -> pd.DataFrame:
-        """Attach aggregated CPC code lists, assignee lists, and optionally
-        claims text to *df*.
-
-        Claims are fetched via a targeted IN-list query (cheap) rather than
-        the full-table UNNEST used in Step 1.
+        Uses a high billing cap (BQ_CLAIMS_BYTES_BILLED).  If the query
+        exceeds the cap or fails, claims_text is left as empty string.
         """
         if df.empty:
-            return df
-
-        pub_numbers = df["publication_number"].tolist()
+            return
+        pub_numbers = df["publication_number"].head(20).tolist()
+        claims_cap = int(os.environ.get("BQ_CLAIMS_BYTES_BILLED", str(130_000_000_000)))
+        claims_config = bigquery.QueryJobConfig(maximum_bytes_billed=claims_cap)
         try:
-            meta_df = self._run_query(self._meta_query(pub_numbers), stage_label="meta")
+            sql = self._claims_query(pub_numbers)
+            print(f"[PatentRetriever] Claims fetch for {len(pub_numbers)} patents (cap={claims_cap/1e9:.0f} GB)")
+            claims_df = self._run_query(sql, stage_label="claims", job_config=claims_config)
+            if not claims_df.empty:
+                df.drop(columns=["claims_text"], errors="ignore", inplace=True)
+                merged = df.merge(
+                    claims_df[["publication_number", "claims_text"]],
+                    on="publication_number",
+                    how="left",
+                )
+                # Update df in-place
+                for col in merged.columns:
+                    df[col] = merged[col].values
+                df["claims_text"] = df["claims_text"].fillna("").astype(str)
+                print(f"  Claims fetched for {claims_df['publication_number'].nunique()} patents")
         except (GoogleAPICallError, Exception) as exc:
-            logger.warning("Metadata query failed (%s) — skipping enrichment", exc)
-            df["cpc_code"]      = [[] for _ in range(len(df))]
+            logger.warning("Claims query failed (%s) — skipping", exc)
+            print(f"[PatentRetriever] Claims fetch FAILED: {exc}")
+            if "claims_text" not in df.columns:
+                df["claims_text"] = ""
+
+    @staticmethod
+    def _parse_scout_aggregations(df: pd.DataFrame) -> None:
+        """Convert CPC/assignee STRING_AGG columns to list columns in-place."""
+        if "cpc_codes_agg" in df.columns:
+            df["cpc_code"] = df["cpc_codes_agg"].apply(
+                lambda v: [x.strip() for x in v.split(" | ")]
+                if isinstance(v, str) and v else []
+            )
+            df.drop(columns=["cpc_codes_agg"], inplace=True)
+        elif "cpc_code" not in df.columns:
+            df["cpc_code"] = [[] for _ in range(len(df))]
+
+        if "assignees_agg" in df.columns:
+            df["assignee_name"] = df["assignees_agg"].apply(
+                lambda v: list(set(x.strip() for x in v.split(" | ")))
+                if isinstance(v, str) and v else []
+            )
+            df.drop(columns=["assignees_agg"], inplace=True)
+        elif "assignee_name" not in df.columns:
             df["assignee_name"] = [[] for _ in range(len(df))]
-            df["claims_text"]   = [""] * len(df)
+
+    @staticmethod
+    def _python_text_filter(df: pd.DataFrame, text_filter: str) -> pd.DataFrame:
+        """Apply BQ-style REGEXP_CONTAINS filter on titles in Python.
+
+        Extracts regex patterns from the BQ text_filter and checks if
+        any pattern matches the ``title`` column locally.
+        """
+        if df.empty or not text_filter or text_filter.strip().startswith("TRUE"):
             return df
 
-        if not meta_df.empty:
-            cpc_agg = (
-                meta_df.groupby("publication_number")["cpc_code"]
-                .apply(list)
-                .reset_index()
-            )
-            assignee_agg = (
-                meta_df.groupby("publication_number")["assignee_name"]
-                .apply(lambda x: list(set(x)))
-                .reset_index()
-            )
-            df = df.merge(cpc_agg, on="publication_number", how="left")
-            df = df.merge(assignee_agg, on="publication_number", how="left")
-        else:
-            df["cpc_code"]      = [[] for _ in range(len(df))]
-            df["assignee_name"] = [[] for _ in range(len(df))]
+        patterns = re.findall(r"r'([^']*)'", text_filter)
+        if not patterns:
+            return df
 
-        # Fetch claims text via targeted query (cheap — filtered by pub number)
-        if fetch_claims and pub_numbers:
+        compiled = []
+        for p in patterns:
             try:
-                claims_df = self._run_query(
-                    self._claims_query(pub_numbers), stage_label="claims"
-                )
-                if not claims_df.empty:
-                    df = df.merge(
-                        claims_df[["publication_number", "claims_text"]],
-                        on="publication_number",
-                        how="left",
-                    )
-                else:
-                    df["claims_text"] = ""
-            except (GoogleAPICallError, Exception) as exc:
-                logger.warning("Claims query failed (%s) — leaving blank", exc)
-                df["claims_text"] = ""
-        elif "claims_text" not in df.columns:
-            df["claims_text"] = ""
+                compiled.append(re.compile(p, re.IGNORECASE))
+            except re.error:
+                pass
 
-        # Ensure list columns contain actual lists (not NaN after left join)
-        for col in ("cpc_code", "assignee_name"):
-            df[col] = df[col].apply(
-                lambda v: v if isinstance(v, list) else []
-            )
-        # Ensure claims_text is always a string (not NaN after left join)
-        if "claims_text" in df.columns:
-            df["claims_text"] = df["claims_text"].fillna("").astype(str)
-        return df
+        if not compiled:
+            return df
+
+        mask = df["title"].apply(
+            lambda t: any(r.search(str(t)) for r in compiled) if pd.notna(t) else False
+        )
+        return df[mask].reset_index(drop=True)
 
     # ------------------------------------------------------------------
     # Post-processing
@@ -673,9 +631,12 @@ class PatentRetriever:
             year = int(str(pub_date)[:4]) if pub_date else min_year
             year_score = (year - min_year) / year_range
 
-            # --- Keyword density -----------------------------------
-            abstract = str(row.get("abstract", "")).lower()
-            kw_hits  = sum(1 for kw in keywords if kw in abstract)
+            # --- Keyword density (title + abstract) ─────────────────
+            text = (
+                str(row.get("title", "")).lower() + " "
+                + str(row.get("abstract", "")).lower()
+            )
+            kw_hits  = sum(1 for kw in keywords if kw in text)
             kw_score = (
                 min(kw_hits / max(len(keywords), 1), 1.0) if keywords else 0.0
             )

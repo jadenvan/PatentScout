@@ -39,11 +39,11 @@ BQ_QUERY_LIMIT_LANDSCAPE = 500   # LIMIT clause for landscape queries
 # ---------------------------------------------------------------------------
 # BigQuery billing caps
 # ---------------------------------------------------------------------------
-# Stage-1 (title + abstract text search): cap at 20 GB — enough for
-# selective REGEXP_CONTAINS with a 2000-01-01 date cutoff on US-only patents.
+# Phase 1 (CPC scout): ~26 GB.  Phase 2 (title fetch): ~19 GB.
+# Cap per query at 30 GB to accommodate both phases with margin.
 # Override via env:  BQ_MAX_BYTES_BILLED (applies to every individual job).
 BQ_MAX_BYTES_BILLED: int = int(
-    os.getenv("BQ_MAX_BYTES_BILLED", str(20_000_000_000))   # 20 GB default
+    os.getenv("BQ_MAX_BYTES_BILLED", str(30_000_000_000))   # 30 GB default
 )
 # Fallback cap used when the primary cap is hit (title-only search).
 BQ_FALLBACK_BYTES_BILLED: int = int(
@@ -51,6 +51,16 @@ BQ_FALLBACK_BYTES_BILLED: int = int(
 )
 # Maximum two-stage attempts before giving up.
 BQ_MAX_FALLBACK_ATTEMPTS: int = int(os.getenv("BQ_MAX_FALLBACK_ATTEMPTS", "2"))
+
+# Minimum filing date (YYYYMMDD) for stage-1 retrieval.  Narrows scan range.
+BQ_MIN_FILING_DATE: int = int(os.getenv("BQ_MIN_FILING_DATE", "20000101"))
+
+# Minimum fraction of stage-1 results that must contain a target keyword
+# for the result set to be considered "relevant enough".
+MIN_RELEVANT_FRACTION: float = float(os.getenv("MIN_RELEVANT_FRACTION", "0.10"))
+
+# Debug flag for extra retrieval logging (set via env, default off)
+DEBUG_RETRIEVAL: bool = os.getenv("DEBUG_RETRIEVAL", "0") in ("1", "true", "True")
 
 # ---------------------------------------------------------------------------
 # Query cost logging
