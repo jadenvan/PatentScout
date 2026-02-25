@@ -3,6 +3,9 @@ Smoke test for PatentScout PDF report generation.
 
 Loads the cached solar charger session, generates a PDF via ReportGenerator,
 and validates basic structural expectations (file size, key text presence).
+
+Also checks ``tests/patentscout_report.pdf`` if it exists (produced by the
+brute-force experiment runner).
 """
 
 import json
@@ -28,6 +31,13 @@ SESSION_PATH = os.path.join(
     os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
     "examples",
     "solar_charger_session.json",
+)
+
+# Path to the final PDF produced by the experiment runner
+FINAL_PDF_PATH = os.path.join(
+    os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+    "tests",
+    "patentscout_report.pdf",
 )
 
 
@@ -114,6 +124,52 @@ class TestPdfContents(unittest.TestCase):
     def test_has_embedding_similarity(self):
         text = self._pdf_text()
         self.assertIn("Embedding Similarity", text)
+
+
+class TestFinalPdf(unittest.TestCase):
+    """Tests for the brute-force experiment runner's output PDF."""
+
+    @classmethod
+    def setUpClass(cls):
+        if not os.path.exists(FINAL_PDF_PATH):
+            raise unittest.SkipTest(
+                f"Final PDF not found at {FINAL_PDF_PATH} — "
+                "run the experiment runner first"
+            )
+        cls.pdf_path = FINAL_PDF_PATH
+        cls._full_text = None
+        if HAS_PDFPLUMBER:
+            with pdfplumber.open(cls.pdf_path) as pdf:
+                cls._full_text = "\n".join(
+                    (page.extract_text() or "") for page in pdf.pages
+                )
+
+    def _pdf_text(self) -> str:
+        if self._full_text is not None:
+            return self._full_text
+        with open(self.pdf_path, "rb") as f:
+            return f.read().decode("latin-1", errors="replace")
+
+    def test_final_pdf_exists_and_size(self):
+        size = os.path.getsize(self.pdf_path)
+        self.assertGreater(size, 5_000, "Final PDF too small")
+        self.assertLess(size, 10_000_000, "Final PDF too large")
+
+    def test_final_pdf_has_feature_label(self):
+        text = self._pdf_text()
+        self.assertIn("Feature", text)
+
+    def test_final_pdf_has_claim_element(self):
+        text = self._pdf_text()
+        self.assertIn("Claim Element", text)
+
+    def test_final_pdf_has_patent_numbers(self):
+        text = self._pdf_text()
+        patents = re.findall(r"US[\-]?\d{5,}", text)
+        self.assertGreaterEqual(
+            len(patents), 5,
+            f"Expected >=5 patent numbers in final PDF; found {len(patents)}",
+        )
 
 
 if __name__ == "__main__":

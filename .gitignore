@@ -8,6 +8,9 @@ venv/
 *.json
 !examples/*.json
 !reports/*.json
+!config/active_config.json
+!tests/_strategy_cache.json
+!examples/similarity_calibration.json
 *.egg-info/
 dist/
 build/
@@ -16,3 +19,5 @@ build/
 service-account-file.json
 .tmp/
 reports/*.pdf
+# Track test artifacts
+!tests/patentscout_report.pdf
