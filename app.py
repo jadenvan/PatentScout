@@ -9,6 +9,7 @@ import io
 import json
 import logging
 import os
+import re
 import tempfile
 import time
 
@@ -31,9 +32,8 @@ load_dotenv()
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
+
 # Credential helpers — support both local .env and Streamlit Cloud secrets
-# ---------------------------------------------------------------------------
 
 
 def _get_gemini_api_key() -> str:
@@ -96,19 +96,17 @@ def _get_embedding_engine() -> "EmbeddingEngine":
     """Load and cache the sentence-transformers model (expensive, load once)."""
     return EmbeddingEngine()
 
-# ---------------------------------------------------------------------------
+
 # Page configuration — must be the very first Streamlit call
-# ---------------------------------------------------------------------------
 
 st.set_page_config(
     page_title="PatentScout",
-    page_icon="🔍",
+    page_icon=":mag:",
     layout="wide",
 )
 
-# ---------------------------------------------------------------------------
+
 # Session-state initialisation — runs before any widget is rendered
-# ---------------------------------------------------------------------------
 
 
 def _init_session_state() -> None:
@@ -116,6 +114,9 @@ def _init_session_state() -> None:
     defaults: dict = {
         "invention_text": "",
         "invention_image": None,   # raw bytes of the uploaded image
+        "sketch_used": False,        # True when doorbell demo with sketch is loaded
+        "is_demo": False,            # True when a demo session is loaded
+        "analysis_timestamp": "",   # datetime string when analysis completed
         "analysis_complete": False,
         "prior_art_results": None,
         "claim_analysis": None,
@@ -144,9 +145,39 @@ def _init_session_state() -> None:
 
 _init_session_state()
 
-# ---------------------------------------------------------------------------
+
+# Global CSS — sticky card + visual refinements
+
+st.markdown("""
+<style>
+/* Fix 1: Sticky Analyzed Invention card */
+[data-testid="stVerticalBlockBorderWrapper"]:has(.analyzed-card-marker) {
+    position: sticky !important;
+    top: 0px;
+    z-index: 50;
+    background: white;
+    box-shadow: 0 2px 8px rgba(0,0,0,0.08);
+}
+/* Fix 3: Visual hierarchy refinements */
+.patentscout-header h1 {
+    font-size: 34px !important;
+    font-weight: 700 !important;
+    margin-bottom: 8px !important;
+}
+.patentscout-subheader {
+    font-size: 16px;
+    font-weight: 600;
+    max-width: 720px;
+    margin-bottom: 32px;
+}
+.how-it-works-step h4 {
+    margin-bottom: 4px !important;
+}
+</style>
+""", unsafe_allow_html=True)
+
+
 # Query cache helpers
-# ---------------------------------------------------------------------------
 
 import hashlib
 
@@ -158,100 +189,497 @@ def get_cache_key(search_strategy: dict) -> str:
     return hashlib.sha256(raw.encode()).hexdigest()[:16]
 
 
-# ---------------------------------------------------------------------------
-# Demo session helpers
-# ---------------------------------------------------------------------------
 
-_DEMO_SESSION_PATH = os.path.join(
-    os.path.dirname(__file__), "examples", "solar_charger_session.json"
-)
+# Demo session helpers  (use shared demo_data module for PDF consistency)
+
+from demo_data import build_solar_demo_data, build_doorbell_demo_data
 
 
-def _save_demo_session() -> None:
-    """Persist the current session state to examples/solar_charger_session.json."""
+def _populate_session_from_data(data: dict) -> None:
+    """Populate all session-state keys from a demo data dict.
+
+    This ensures that app tabs see the EXACT same data that the PDF
+    report generator uses — no more inconsistency.
+    """
     import pandas as pd
 
-    def _serial(obj):
-        if isinstance(obj, pd.DataFrame):
-            return obj.to_dict(orient="records")
-        if isinstance(obj, (bytes, bytearray)):
-            return None   # skip binary blobs
-        if hasattr(obj, "tolist"):
-            return obj.tolist()
-        return str(obj)
+    from datetime import datetime
+    st.session_state["invention_text"]     = data.get("invention_text", "")
+    st.session_state["invention_image"]    = data.get("invention_image")
+    st.session_state["sketch_used"]        = data.get("sketch_used", False)
+    st.session_state["is_demo"]            = True
+    st.session_state["analysis_timestamp"] = datetime.now().strftime("%Y-%m-%d %H:%M")
+    st.session_state["search_strategy"]    = data.get("search_strategy")
+    st.session_state["similarity_results"] = data.get("similarity_results")
+    st.session_state["comparison_matrix"]  = data.get("comparison_matrix")
+    st.session_state["white_spaces"]       = data.get("white_spaces")
+    st.session_state["query_costs"]        = data.get("query_costs", [])
+    st.session_state["total_gb_scanned"]   = data.get("total_gb_scanned", 0.0)
+    st.session_state["_pdf_bytes"]         = None
 
-    snapshot = {
-        "invention_text":   st.session_state.get("invention_text", ""),
-        "search_strategy":  st.session_state.get("search_strategy"),
-        "detail_patents":   _serial(st.session_state.get("detail_patents")),
-        "landscape_patents": _serial(st.session_state.get("landscape_patents")),
-        "parsed_claims":    st.session_state.get("parsed_claims"),
-        "similarity_results": {
-            k: v if not hasattr(v, "tolist") else v.tolist()
-            for k, v in (st.session_state.get("similarity_results") or {}).items()
-            if k != "matrix"
-        },
-        "comparison_matrix": st.session_state.get("comparison_matrix"),
-        "white_spaces":     st.session_state.get("white_spaces"),
-        "query_costs":      st.session_state.get("query_costs", []),
-        "total_gb_scanned": st.session_state.get("total_gb_scanned", 0.0),
-    }
-    os.makedirs(os.path.dirname(_DEMO_SESSION_PATH), exist_ok=True)
+    # detail_patents — convert list→DataFrame
+    raw_detail = data.get("detail_patents")
+    if isinstance(raw_detail, list):
+        st.session_state["detail_patents"] = pd.DataFrame(raw_detail)
+    elif isinstance(raw_detail, pd.DataFrame):
+        st.session_state["detail_patents"] = raw_detail
+    else:
+        st.session_state["detail_patents"] = None
+
+    # landscape_patents — convert list→DataFrame and build figures
+    raw_landscape = data.get("landscape_patents")
+    if isinstance(raw_landscape, list):
+        landscape_df = pd.DataFrame(raw_landscape)
+    elif isinstance(raw_landscape, pd.DataFrame):
+        landscape_df = raw_landscape
+    else:
+        landscape_df = None
+    st.session_state["landscape_patents"] = landscape_df
+
+    if landscape_df is not None and not landscape_df.empty:
+        try:
+            _analyzer = LandscapeAnalyzer(landscape_df)
+            _figs = {
+                "filing_trends":    _analyzer.filing_trends(),
+                "top_assignees":    _analyzer.top_assignees(),
+                "cpc_distribution": _analyzer.cpc_distribution(),
+            }
+            st.session_state["landscape_figures"] = _figs
+            st.session_state["chart_images"] = (
+                _analyzer.export_charts_as_images(_figs)
+            )
+        except Exception as _la_exc:
+            logger.warning("LandscapeAnalyzer failed during demo load: %s", _la_exc)
+            st.session_state["landscape_figures"] = {}
+            st.session_state["chart_images"] = {}
+    else:
+        st.session_state["landscape_figures"] = None
+        st.session_state["chart_images"] = {}
+
+    # parsed_claims — normalise list form to {"summary": ..., "results": ...} dict
+    raw_claims = data.get("parsed_claims")
+    if isinstance(raw_claims, list):
+        st.session_state["parsed_claims"] = {
+            "summary": {
+                "attempted": len(raw_claims),
+                "successful": len(raw_claims),
+                "skipped": 0,
+                "failed": 0,
+            },
+            "results": raw_claims,
+        }
+    else:
+        st.session_state["parsed_claims"] = raw_claims
+
+    st.session_state["analysis_complete"] = True
+
+
+def _load_solar_demo() -> bool:
+    """Build and load the solar charger demo into session state."""
     try:
-        with open(_DEMO_SESSION_PATH, "w") as fh:
-            json.dump(snapshot, fh, indent=2, default=_serial)
-        logger.info("Demo session saved to %s", _DEMO_SESSION_PATH)
-    except Exception as exc:
-        logger.warning("Could not save demo session: %s", exc)
-
-
-def _load_demo_session() -> bool:
-    """Load the canonical demo session from disk into st.session_state.
-    Returns True on success."""
-    import pandas as pd
-
-    if not os.path.exists(_DEMO_SESSION_PATH):
-        return False
-    try:
-        with open(_DEMO_SESSION_PATH) as fh:
-            snap = json.load(fh)
-
-        st.session_state["invention_text"] = snap.get("invention_text", "")
-        st.session_state["search_strategy"] = snap.get("search_strategy")
-
-        raw_detail = snap.get("detail_patents")
-        if raw_detail:
-            st.session_state["detail_patents"] = pd.DataFrame(raw_detail)
-
-        raw_landscape = snap.get("landscape_patents")
-        if raw_landscape:
-            st.session_state["landscape_patents"] = pd.DataFrame(raw_landscape)
-
-        st.session_state["parsed_claims"]     = snap.get("parsed_claims")
-        st.session_state["similarity_results"] = snap.get("similarity_results")
-        st.session_state["comparison_matrix"] = snap.get("comparison_matrix")
-        st.session_state["white_spaces"]       = snap.get("white_spaces")
-        st.session_state["query_costs"]        = snap.get("query_costs", [])
-        st.session_state["total_gb_scanned"]   = snap.get("total_gb_scanned", 0.0)
-        st.session_state["analysis_complete"]  = True
+        data = build_solar_demo_data()
+        _populate_session_from_data(data)
         return True
     except Exception as exc:
-        logger.warning("Could not load demo session: %s", exc)
+        logger.warning("Could not build solar demo data: %s", exc)
         return False
 
 
-# ---------------------------------------------------------------------------
+def _load_doorbell_demo() -> bool:
+    """Build and load the smart doorbell demo (with sketch) into session state."""
+    try:
+        data = build_doorbell_demo_data()
+        _populate_session_from_data(data)
+        if not data.get("sketch_used"):
+            st.warning(
+                "Sketch file not found at assets/demo/doorbell_sketch.* — "
+                "loading text-only demo"
+            )
+        return True
+    except Exception as exc:
+        logger.warning("Could not build doorbell demo data: %s", exc)
+        return False
+
+
+
+# Helper: highlight overlapping terms between two texts
+
+
+def highlight_overlapping_terms(text: str, reference_text: str, min_word_length: int = 4) -> str:
+    """Highlight words in *text* that also appear in *reference_text*."""
+    ref_words = set(
+        w.lower() for w in re.findall(r'\b\w+\b', reference_text)
+        if len(w) >= min_word_length
+    )
+    stopwords = {
+        "that", "this", "with", "from", "have", "been", "were", "will",
+        "said", "each", "which", "their", "than", "into", "more", "also",
+        "configured", "wherein", "thereof", "therein", "herein",
+    }
+    ref_words -= stopwords
+
+    def _replace(m):
+        word = m.group()
+        if word.lower() in ref_words:
+            return (
+                f'<span style="background-color: #FFEB3B; padding: 1px 3px; '
+                f'border-radius: 2px; font-weight: bold;">{word}</span>'
+            )
+        return word
+
+    return re.sub(r'\b\w+\b', _replace, text)
+
+
+
+# Helper: Executive Summary tab renderer
+
+
+def _render_executive_summary() -> None:
+    """Render the Executive Summary dashboard tab."""
+    strategy = st.session_state.get("search_strategy") or {}
+    features = strategy.get("features", [])
+    detail_df = st.session_state.get("detail_patents")
+    sim = st.session_state.get("similarity_results") or {}
+    white_spaces = st.session_state.get("white_spaces") or []
+    stats = sim.get("stats", {})
+    matches = sim.get("matches", [])
+
+    total_detail_patents = len(detail_df) if detail_df is not None else 0
+    high_count = stats.get("high_matches", 0)
+    feature_count = len(features)
+    ws_count = len(white_spaces)
+
+    # Row 1 — Metric cards
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("Patents Analyzed", total_detail_patents)
+    c2.metric("High Matches", high_count)
+    c3.metric("Features Mapped", feature_count)
+    c4.metric("White Space Opportunities", ws_count)
+
+    st.divider()
+
+    # Row 2 — Overall risk assessment
+    if feature_count > 0 and matches:
+        features_with_high = set()
+        for m in matches:
+            if m.get("similarity_level") in ("HIGH", "MODERATE"):
+                # count features that have at least one high/mod match
+                features_with_high.add(m.get("feature_label", ""))
+        risk_n = len(features_with_high)
+        risk_pct = risk_n / feature_count if feature_count else 0
+        if risk_pct >= 0.5:
+            st.error(
+                f"\U0001f534 **HIGH RISK** — Significant prior art overlap "
+                f"found in {risk_n} of {feature_count} features"
+            )
+        elif risk_pct >= 0.25:
+            st.warning(
+                f"\U0001f7e1 **MODERATE RISK** — Some prior art overlap "
+                f"detected in {risk_n} of {feature_count} features"
+            )
+        else:
+            st.success(
+                "\U0001f7e2 **LOW RISK** — Limited prior art overlap found"
+            )
+    else:
+        st.info("Insufficient data to compute risk assessment.")
+
+    st.divider()
+
+    # Row 3 — Feature coverage table
+    if features and total_detail_patents > 0:
+        st.subheader("Feature Prior Art Exposure")
+        feature_rows = []
+        for feat in features:
+            label = feat.get("label", "")
+            matching_patents: set[str] = set()
+            top_score = 0.0
+            for m in matches:
+                if (
+                    m.get("feature_label") == label
+                    and m.get("similarity_level") in ("HIGH", "MODERATE")
+                ):
+                    matching_patents.add(m.get("patent_number", ""))
+                    top_score = max(top_score, m.get("similarity_score", 0))
+            n_match = len(matching_patents)
+            coverage_pct = n_match / total_detail_patents * 100
+            if coverage_pct >= 60:
+                risk_label = "\U0001f534 HIGH"
+                action = "Design-around needed"
+            elif coverage_pct >= 30:
+                risk_label = "\U0001f7e1 MED"
+                action = "Further investigation"
+            else:
+                risk_label = "\U0001f7e2 LOW"
+                action = "Potential opportunity"
+            feature_rows.append({
+                "Feature": label,
+                "Coverage": f"{coverage_pct:.0f}% ({n_match}/{total_detail_patents})",
+                "Top Score": f"{top_score:.3f}" if top_score > 0 else "—",
+                "Risk": risk_label,
+                "Suggested Action": action,
+                "coverage_pct": coverage_pct,
+                "label": label,
+            })
+
+        import pandas as _pd_es
+        display_rows = [
+            {k: v for k, v in r.items() if k not in ("coverage_pct", "label")}
+            for r in feature_rows
+        ]
+        st.dataframe(
+            _pd_es.DataFrame(display_rows),
+            use_container_width=True,
+            hide_index=True,
+        )
+    else:
+        feature_rows = []
+
+    st.divider()
+
+    # Row 4 — Top 3 closest patents
+    if matches:
+        st.subheader("Closest Prior Art")
+        # Build patent title lookup
+        _title_map: dict[str, str] = {}
+        if detail_df is not None:
+            for _, row in detail_df.iterrows():
+                pn = row.get("publication_number", "")
+                t = row.get("title", "")
+                if pn and t:
+                    _title_map[str(pn)] = str(t)
+
+        seen_patents: set[str] = set()
+        top3: list[dict] = []
+        for m in sorted(matches, key=lambda x: x.get("similarity_score", 0), reverse=True):
+            pn = m.get("patent_number", "")
+            if pn not in seen_patents:
+                seen_patents.add(pn)
+                top3.append(m)
+            if len(top3) >= 3:
+                break
+
+        for i, m in enumerate(top3, 1):
+            pat_title = _title_map.get(m.get("patent_number", ""), "")
+            title_suffix = f" — {pat_title}" if pat_title else ""
+            st.markdown(
+                f"**{i}. {m['patent_number']}** "
+                f"(Score: {m['similarity_score']:.3f}){title_suffix}"
+            )
+
+    st.divider()
+
+    # Row 5 — Key recommendation
+    if feature_rows:
+        st.subheader("Key Recommendation")
+        low_coverage = [f for f in feature_rows if f["coverage_pct"] < 30]
+        high_risk = [f for f in feature_rows if f["coverage_pct"] >= 60]
+
+        if low_coverage:
+            opportunity_names = ", ".join(f["label"] for f in low_coverage[:2])
+            st.info(
+                f"Strongest differentiation opportunity lies in "
+                f"**{opportunity_names}**, which show limited prior art "
+                f"coverage. Consider emphasizing these in patent claims."
+            )
+        if high_risk:
+            risk_names = ", ".join(f["label"] for f in high_risk[:2])
+            st.warning(
+                f"**{risk_names}** have significant prior art overlap. "
+                f"Design-around strategies should be explored before filing."
+            )
+        if not low_coverage and not high_risk:
+            st.info(
+                "All features show moderate prior art presence. "
+                "A detailed freedom-to-operate analysis is recommended."
+            )
+
+    st.divider()
+
+    # Row 6 — Download button
+    if st.session_state.get("_pdf_bytes"):
+        st.download_button(
+            "\U0001f4e5 Download Full Report",
+            data=st.session_state["_pdf_bytes"],
+            file_name="patentscout_report.pdf",
+            mime="application/pdf",
+            key="exec_summary_download_btn",
+        )
+    else:
+        _retrieval_done = st.session_state.get("detail_patents") is not None
+        if _retrieval_done:
+            if st.button("\U0001f4c4 Generate Report", key="exec_summary_gen_btn"):
+                with st.spinner("Generating PDF..."):
+                    try:
+                        _rg = ReportGenerator()
+                        _pdf_bytes = _rg.generate(dict(st.session_state))
+                        st.session_state["_pdf_bytes"] = _pdf_bytes
+                        st.rerun()
+                    except Exception as _rg_exc:
+                        st.error(f"Report generation failed: {_rg_exc}")
+
+
+
+# Helper: demo progress bar
+
+
+def _show_demo_progress() -> None:
+    """Show a brief staged progress bar when loading demo data."""
+    stages = [
+        "\U0001f50d Loading extracted features...",
+        "\U0001f5c4\ufe0f Loading cached patent data...",
+        "\U0001f4cb Loading parsed claims...",
+        "\U0001f9ee Loading similarity results...",
+        "\U0001f916 Loading AI analysis...",
+        "\U0001f4ca Loading landscape data...",
+        "\u2705 Demo loaded!",
+    ]
+    progress_bar = st.progress(0)
+    for i, stage in enumerate(stages):
+        progress_bar.progress((i + 1) / len(stages), text=stage)
+        time.sleep(0.15)
+    progress_bar.empty()
+
+
+
 # Helper: results renderer  (defined BEFORE any code that calls it)
-# ---------------------------------------------------------------------------
+
+
+def _render_analyzed_invention_card() -> None:
+    """Render a persistent card above tabs showing what was analyzed."""
+    with st.container(border=True):
+        st.markdown('<div class="analyzed-card-marker"></div>', unsafe_allow_html=True)
+        st.markdown("**Analyzed Invention**")
+
+        # Show description (truncated)
+        desc = st.session_state.get("invention_text", "")
+        if desc:
+            truncated = desc[:300] + "..." if len(desc) > 300 else desc
+            st.markdown(f'"{truncated}"')
+            if len(desc) > 300:
+                with st.expander("Show full description"):
+                    st.markdown(desc)
+
+        # Show sketch thumbnail + expander if present
+        if st.session_state.get("invention_image"):
+            col_thumb, col_expand = st.columns([1, 3])
+            with col_thumb:
+                st.image(st.session_state["invention_image"], width=120)
+            with col_expand:
+                with st.expander("View full-size sketch"):
+                    st.image(st.session_state["invention_image"], use_container_width=True)
+
+        # Metadata row
+        has_text = bool(st.session_state.get("invention_text"))
+        has_sketch = bool(st.session_state.get("invention_image"))
+        if has_text and has_sketch:
+            sub_type = "Text + Sketch"
+        elif has_sketch:
+            sub_type = "Sketch"
+        else:
+            sub_type = "Text"
+
+        source = "Demo" if st.session_state.get("is_demo") else "User"
+        feature_count = len(st.session_state.get("search_strategy", {}).get("features", []))
+
+        meta_cols = st.columns(4)
+        meta_cols[0].caption(f"Submission: {sub_type}")
+        meta_cols[1].caption(f"Source: {source}")
+        meta_cols[2].caption(f"{feature_count} features extracted")
+        meta_cols[3].caption(f"{st.session_state.get('analysis_timestamp', '')}")
+
+        # Demo badge
+        if source == "Demo":
+            st.caption("Demo Example")
+
+
+def _render_extracted_features_tab() -> None:
+    """Render the Extracted Features tab content."""
+    st.header("Extracted Features")
+    st.caption("AI-identified technical features from your invention description")
+
+    # Show full-size sketch at top of features tab when sketch was used
+    if st.session_state.get("sketch_used") and st.session_state.get("invention_image"):
+        st.subheader("Design Sketch Input")
+        st.image(st.session_state["invention_image"], use_container_width=True)
+        st.caption("Features enhanced by sketch analysis are marked with a badge")
+        st.divider()
+
+    features = st.session_state.get("search_strategy", {}).get("features", [])
+    similarity_results = st.session_state.get("similarity_results", {}) or {}
+    matches = similarity_results.get("matches", [])
+
+    for feature in features:
+        source = feature.get("source", "text")
+
+        with st.container(border=True):
+            # Header row
+            col1, col2 = st.columns([3, 1])
+            with col1:
+                st.markdown(f"### {feature['label']}")
+            with col2:
+                if source == "sketch":
+                    st.markdown(
+                        '<span style="background-color:#E3F2FD;padding:2px 8px;'
+                        'border-radius:10px;font-size:0.8em;">Sketch</span>',
+                        unsafe_allow_html=True,
+                    )
+                else:
+                    st.markdown(
+                        '<span style="background-color:#F5F5F5;padding:2px 8px;'
+                        'border-radius:10px;font-size:0.8em;">Text</span>',
+                        unsafe_allow_html=True,
+                    )
+
+            # Description
+            st.markdown(feature.get("description", ""))
+
+            # Keywords
+            keywords = feature.get("keywords", [])
+            if keywords:
+                kw_str = " \u00b7 ".join(keywords[:6])
+                st.caption(f"Keywords: {kw_str}")
+
+            # Matching patents (expandable)
+            feature_matches = [m for m in matches if m.get("feature_label") == feature.get("label")]
+            high_mod = [m for m in feature_matches if m.get("similarity_level") in ("HIGH", "MODERATE")]
+
+            if high_mod:
+                with st.expander(f"View matching claim elements ({len(high_mod)} patents)"):
+                    for m in sorted(high_mod, key=lambda x: x.get("similarity_score", 0), reverse=True)[:5]:
+                        score = m.get("similarity_score", 0)
+                        level = m.get("similarity_level", "")
+                        color = "#FF4444" if level == "HIGH" else "#FF9800"
+                        st.markdown(
+                            f"**{m.get('patent_number', '')}** "
+                            f'<span style="color:{color}">({score:.3f} {level})</span>: '
+                            f"*{m.get('element_text', '')[:120]}...*",
+                            unsafe_allow_html=True,
+                        )
+            else:
+                st.caption("No strong prior art matches found for this feature")
 
 
 def _render_results() -> None:
-    """Render the four-tab results layout."""
-    tab_prior, tab_claims, tab_landscape, tab_report = st.tabs(
-        ["Prior Art Results", "Claim Analysis", "Landscape", "Report"]
+    """Render the six-tab results layout."""
+
+    # Analyzed Invention card — above tabs
+    _render_analyzed_invention_card()
+
+    tab_summary, tab_features, tab_prior, tab_claims, tab_landscape, tab_report = st.tabs(
+        ["Executive Summary", "Extracted Features", "Prior Art Results", "Claim Analysis", "Landscape", "Report"]
     )
 
-    # Tab 1 — Prior Art Results
+    # Tab 0 — Executive Summary
+    with tab_summary:
+        st.subheader("Executive Summary")
+        _render_executive_summary()
+
+    # Tab 1 — Extracted Features
+    with tab_features:
+        _render_extracted_features_tab()
+
+    # Tab 2 — Prior Art Results
     with tab_prior:
         st.subheader("Retrieved Patents")
         detail_df = st.session_state.get("detail_patents")
@@ -260,14 +688,19 @@ def _render_results() -> None:
         else:
             # --- Metric cards -------------------------------------------
             try:
-                unique_assignees = set(
-                    a
-                    for asg_list in detail_df["assignee_name"]
-                    if isinstance(asg_list, list)
-                    for a in asg_list
-                    if a
-                )
-                dates = detail_df["publication_date"].dropna()
+                unique_assignees = set()
+                for asg in detail_df["assignee_name"]:
+                    if isinstance(asg, list):
+                        for a in asg:
+                            if a:
+                                unique_assignees.add(a)
+                    elif isinstance(asg, str) and asg:
+                        unique_assignees.add(asg)
+
+                import pandas as _pd_metric
+                dates = _pd_metric.to_numeric(
+                    detail_df["publication_date"], errors="coerce"
+                ).dropna()
                 dates = dates[dates > 0]
                 if not dates.empty:
                     oldest = str(int(dates.min()))[:4]
@@ -334,26 +767,35 @@ def _render_results() -> None:
 
             # --- Success banner -----------------------------------------
             st.success(
-                f"✅ Retrieved {len(detail_df)} patents from Google BigQuery "
+                f"Retrieved {len(detail_df)} patents from Google BigQuery "
                 "Patents Database (100M+ publications)"
             )
 
-    # Tab 2 — Claim Analysis
+    # Tab 3 — Claim Analysis
     with tab_claims:
         st.subheader("Feature vs. Claim Comparison")
         claim_data = st.session_state.get("parsed_claims")
         if claim_data is None:
             st.info("Claim mapping will appear here after analysis.")
         else:
+            # parsed_claims may be stored as a list (from demo session) or dict
+            if isinstance(claim_data, list):
+                claim_data = {"summary": {"attempted": len(claim_data), "successful": len(claim_data), "skipped": 0, "failed": 0}, "results": claim_data}
             summary = claim_data.get("summary", {})
             attempted  = summary.get("attempted", 0)
             successful = summary.get("successful", 0)
             skipped    = summary.get("skipped", 0)
             failed     = summary.get("failed", 0)
 
+            _status_parts = []
+            if skipped > 0:
+                _status_parts.append(f"{skipped} had no claims data")
+            if failed > 0:
+                _status_parts.append(f"{failed} failed to parse")
+            _status_suffix = f" ({', '.join(_status_parts)})" if _status_parts else ""
             st.markdown(
-                f"Parsed claims for **{successful}** out of **{attempted}** patents "
-                f"({skipped} had no claims data, {failed} failed to parse)"
+                f"Parsed claims for **{successful}** out of **{attempted}** patents"
+                + _status_suffix
             )
 
             # ----------------------------------------------------------------
@@ -367,7 +809,7 @@ def _render_results() -> None:
                 st.subheader("Similarity Analysis")
 
                 # --- Legend -----------------------------------------------
-                with st.expander("ℹ️ How to read this table", expanded=False):
+                with st.expander("How to read this table", expanded=False):
                     st.markdown(
                         """
 **Two-layer analysis:** each match is scored by both an embedding model
@@ -375,10 +817,10 @@ def _render_results() -> None:
 
 | Badge | Meaning |
 |-------|---------|
-| 🔴 HIGH | Strong overlap in both layers |
-| 🟠 MODERATE | Partial overlap; notable differences present |
-| ⚪ LOW | Incidental or surface-level similarity only |
-| ⚠️ DIVERGENCE | The two layers disagree — human review recommended |
+| HIGH | Strong overlap in both layers |
+| MODERATE | Partial overlap; notable differences present |
+| LOW | Incidental or surface-level similarity only |
+| DIVERGENCE | The two layers disagree — human review recommended |
 
 **What this tool cannot do:** determine infringement, assess claim validity,
 or replace professional patent counsel.
@@ -386,14 +828,14 @@ or replace professional patent counsel.
                     )
 
                 if sim.get("error"):
-                    st.warning(f"⚠️ {sim['error']}")
+                    st.warning(f"{sim['error']}")
                 else:
                     stats = sim.get("stats", {})
                     c1, c2, c3, c4 = st.columns(4)
                     c1.metric("Total Comparisons", stats.get("total_comparisons", 0))
-                    c2.metric("🔴 High Similarity", stats.get("high_matches", 0))
-                    c3.metric("🟠 Moderate", stats.get("moderate_matches", 0))
-                    c4.metric("⚪ Low", stats.get("low_matches", 0))
+                    c2.metric("High Similarity", stats.get("high_matches", 0))
+                    c3.metric("Moderate", stats.get("moderate_matches", 0))
+                    c4.metric("Low", stats.get("low_matches", 0))
 
                     matches = sim.get("matches", [])
                     if not matches:
@@ -403,72 +845,108 @@ or replace professional patent counsel.
                             "natural language descriptions."
                         )
                     elif cmat is not None and len(cmat) > 0:
-                        # ---- ENRICHED two-layer view ---------------------
+                        # ---- ENRICHED two-layer view (grouped by patent) --
+                        from modules.report_helpers import group_matches_by_patent
+
                         st.markdown("**Contextual Analysis — Top Matches (AI-enriched)**")
                         _bg   = {"HIGH": "#ffd6d6", "MODERATE": "#ffe4b5", "LOW": "#f0f0f0"}
-                        _icon = {"HIGH": "🔴", "MODERATE": "🟠", "LOW": "⚪"}
-                        _conf_colour = {"HIGH": "🟢", "MODERATE": "🟡", "LOW": "🔴"}
+                        _icon = {"HIGH": "[H]", "MODERATE": "[M]", "LOW": "[L]"}
+                        _conf_colour = {"HIGH": "[H]", "MODERATE": "[M]", "LOW": "[L]"}
 
-                        for em in cmat:
-                            overall = em.get("overall_confidence", "LOW")
-                            div_flag = em.get("divergence_flag", False)
-                            embed_lvl = em.get("similarity_level", "LOW")
-                            gem_conf  = em.get("gemini_confidence", "LOW")
-                            score     = em.get("similarity_score", 0.0)
-                            pat_num   = em.get("patent_number", "")
-                            claim_num = em.get("claim_number", "")
+                        grouped = group_matches_by_patent(cmat)
+                        for pat_group in grouped:
+                            overall = pat_group.get("overall_confidence", "LOW")
+                            div_flag = pat_group.get("divergence_flag", False)
+                            pat_num   = pat_group.get("patent_number", "")
+                            best_score = pat_group.get("best_score", 0.0)
+                            n_features = pat_group.get("feature_count", 1)
 
-                            # Build expander label
-                            div_prefix = "⚠️ " if div_flag else ""
-                            icon = _icon.get(overall, "⚪")
+                            # Build expander label — one per patent
+                            div_prefix = "[!] " if div_flag else ""
+                            icon = _icon.get(overall, "[L]")
+                            feature_names = ", ".join(
+                                f.get("feature_label", "")
+                                for f in pat_group.get("all_features", [])[:3]
+                            )
+                            if n_features > 3:
+                                feature_names += f" (+{n_features - 3} more)"
                             exp_label = (
-                                f"{div_prefix}{icon} **{em['feature_label']}** — "
-                                f"{em['element_text'][:80]}{'…' if len(em['element_text']) > 80 else ''} "
-                                f"| {pat_num} Cl.{claim_num} | "
-                                f"Embed: {score:.3f} | Overall: {overall}"
+                                f"{div_prefix}{icon} **{pat_num}** — "
+                                f"Best: {best_score:.3f} ({overall}) — "
+                                f"{n_features} feature(s): {feature_names}"
                             )
 
                             with st.expander(exp_label, expanded=False):
                                 # Divergence warning banner
                                 if div_flag:
                                     st.warning(
-                                        f"⚠️ **Divergence detected:** "
-                                        f"{em.get('divergence_note', '')}"
+                                        f"**Divergence detected:** "
+                                        f"{pat_group.get('divergence_note', '')}"
                                     )
 
-                                # Confidence badges row
-                                b1, b2, b3 = st.columns(3)
-                                b1.markdown(
-                                    f"**Embedding Layer**  \n"
-                                    f"{_icon.get(embed_lvl, '⚪')} {embed_lvl}  \n"
-                                    f"Score: `{score:.3f}`"
-                                )
-                                b2.markdown(
-                                    f"**Gemini Layer**  \n"
-                                    f"{_conf_colour.get(gem_conf, '🔴')} {gem_conf}"
-                                )
-                                b3.markdown(
-                                    f"**Overall**  \n"
-                                    f"{_icon.get(overall, '⚪')} {overall}"
-                                )
+                                # Show each feature matched to this patent — side-by-side view
+                                for fi, feat in enumerate(pat_group.get("all_features", [])):
+                                    feat_conf = feat.get("overall_confidence", "LOW")
+                                    feat_icon = _icon.get(feat_conf, "[L]")
+                                    st.markdown(
+                                        f"{feat_icon} **{feat.get('feature_label', '')}** — "
+                                        f"Claim {feat.get('claim_number', '?')} — "
+                                        f"Score: `{feat.get('similarity_score', 0):.3f}` ({feat_conf})"
+                                    )
 
-                                st.divider()
+                                    # Side-by-side comparison columns
+                                    left_col, right_col = st.columns(2)
+                                    feat_desc = feat.get("feature_description", "")
+                                    elem_txt = feat.get("element_text", "")
+                                    with left_col:
+                                        st.markdown("**Your Feature**")
+                                        st.markdown(f"**{feat.get('feature_label', '')}**")
+                                        if feat_desc and elem_txt:
+                                            st.markdown(
+                                                highlight_overlapping_terms(feat_desc, elem_txt),
+                                                unsafe_allow_html=True,
+                                            )
+                                        elif feat_desc:
+                                            st.markdown(feat_desc)
+                                    with right_col:
+                                        st.markdown("**Matched Claim Element**")
+                                        st.markdown(f"*{feat.get('patent_number', '')}*")
+                                        if elem_txt and feat_desc:
+                                            st.markdown(
+                                                highlight_overlapping_terms(elem_txt, feat_desc),
+                                                unsafe_allow_html=True,
+                                            )
+                                        elif elem_txt:
+                                            st.markdown(elem_txt[:300])
 
-                                st.markdown(
-                                    "**What this claim element legally requires:**"
-                                )
-                                st.info(em.get("gemini_explanation", "—"))
+                                    # Gemini analysis per-feature
+                                    if feat.get("gemini_assessment"):
+                                        st.markdown(f"**Analysis:** {feat['gemini_assessment']}")
+                                    if feat.get("key_distinctions"):
+                                        st.markdown("**Key Distinctions:**")
+                                        for _d in feat["key_distinctions"]:
+                                            st.markdown(f"- {_d}")
 
-                                st.markdown("**Technical Comparison:**")
-                                st.write(em.get("gemini_assessment", "—"))
+                                    if fi < len(pat_group.get("all_features", [])) - 1:
+                                        st.divider()
 
-                                key_dist = em.get("key_distinctions", [])
+                                # Show Gemini analysis from best match (patent-level)
+                                gemini_expl = pat_group.get("gemini_explanation", "")
+                                gemini_asmt = pat_group.get("gemini_assessment", "")
+                                if gemini_expl:
+                                    st.markdown("**What this claim element legally requires:**")
+                                    st.info(gemini_expl)
+                                if gemini_asmt:
+                                    st.markdown("**Technical Comparison:**")
+                                    st.write(gemini_asmt)
+
+                                key_dist = pat_group.get("key_distinctions", [])
                                 if key_dist:
-                                    st.markdown("**Key Distinctions:**")
+                                    st.markdown("**Key Distinctions (Patent-level):**")
                                     for d in key_dist:
                                         st.markdown(f"- {d}")
 
-                                cannot = em.get("cannot_determine", "")
+                                cannot = pat_group.get("cannot_determine", "")
                                 if cannot:
                                     st.markdown("**Cannot Determine Without Expert Review:**")
                                     st.caption(cannot)
@@ -480,7 +958,7 @@ or replace professional patent counsel.
                         ]
                         if low_only:
                             with st.expander(
-                                f"⚪ {len(low_only)} low-similarity match(es) "
+                                f"{len(low_only)} low-similarity match(es) "
                                 "(embedding-only, not analysed by Gemini)"
                             ):
                                 import pandas as _pd2
@@ -501,7 +979,7 @@ or replace professional patent counsel.
                                 top_rows.append(m)
 
                         _bg   = {"HIGH": "#ffd6d6", "MODERATE": "#ffe4b5", "LOW": "#f0f0f0"}
-                        _icon = {"HIGH": "🔴", "MODERATE": "🟠", "LOW": "⚪"}
+                        _icon = {"HIGH": "[H]", "MODERATE": "[M]", "LOW": "[L]"}
 
                         header_cells = "".join(
                             f"<th style='padding:6px 10px;background:#f8f8f8;"
@@ -556,11 +1034,11 @@ or replace professional patent counsel.
                         st.markdown("**Features With No Strong Prior Art Match**")
                         for uf in unmatched:
                             st.markdown(
-                                f"✅ **{uf['label']}** — {uf.get('description', '')}"
+                                f"**{uf['label']}** — {uf.get('description', '')}"
                             )
                     elif matches:
                         st.success(
-                            "✅ All features have at least one HIGH or MODERATE match "
+                            "All features have at least one HIGH or MODERATE match "
                             "in the retrieved patents."
                         )
 
@@ -578,7 +1056,7 @@ or replace professional patent counsel.
                     ind   = parsed.get("independent_claims", [])
                     total = parsed.get("total_claims_found", 0)
                     conf  = parsed.get("parsing_confidence", "")
-                    conf_colour = {"HIGH": "🟢", "MODERATE": "🟡", "LOW": "🔴"}.get(conf, "")
+                    conf_colour = {"HIGH": "[H]", "MODERATE": "[M]", "LOW": "[L]"}.get(conf, "")
                     label = (
                         f"{conf_colour} {pub} — "
                         f"{len(ind)} independent claim(s) of {total} total "
@@ -624,13 +1102,14 @@ or replace professional patent counsel.
                 )
             else:
                 _ws_conf_icon = {
-                    "HIGH": "🟢", "MODERATE": "🟡",
-                    "LOW": "🔴", "INSUFFICIENT": "⚫",
+                    "HIGH": "[H]", "MODERATE": "[M]",
+                    "LOW": "[L]", "INSUFFICIENT": "[?]",
                 }
                 _ws_type_icon = {
-                    "Feature Gap": "🔍",
-                    "Classification Gap": "📂",
-                    "Combination Novelty": "✨",
+                    "Feature Gap": "[ ]",
+                    "Classification Gap": "[ ]",
+                    "Classification Density": "[ ]",
+                    "Combination Novelty": "[ ]",
                 }
                 st.markdown(
                     f"Found **{len(white_spaces)}** potential white-space "
@@ -639,8 +1118,8 @@ or replace professional patent counsel.
                 for ws in white_spaces:
                     conf = ws.get("confidence", {})
                     conf_level = conf.get("level", "LOW")
-                    conf_icon = _ws_conf_icon.get(conf_level, "⚫")
-                    type_icon = _ws_type_icon.get(ws["type"], "🔹")
+                    conf_icon = _ws_conf_icon.get(conf_level, "[?]")
+                    type_icon = _ws_type_icon.get(ws["type"], "[ ]")
                     exp_label = (
                         f"{type_icon} **{ws['type']}** {conf_icon} {conf_level} "
                         f"— {ws['title']}"
@@ -654,16 +1133,24 @@ or replace professional patent counsel.
                             import pandas as _pd_ws
                             _bp_rows = []
                             for bp in boundary:
-                                score_str = (
-                                    f"{bp['score']:.3f}"
-                                    if bp.get("score") is not None
-                                    else "—"
-                                )
-                                _bp_rows.append({
-                                    "Patent": bp.get("patent", ""),
-                                    "Score": score_str,
-                                    "Claim Element": bp.get("element", ""),
-                                })
+                                if isinstance(bp, dict):
+                                    score_str = (
+                                        f"{bp['score']:.3f}"
+                                        if bp.get("score") is not None
+                                        else "—"
+                                    )
+                                    _bp_rows.append({
+                                        "Patent": bp.get("patent", ""),
+                                        "Score": score_str,
+                                        "Claim Element": bp.get("element", ""),
+                                    })
+                                else:
+                                    # boundary_patents may be plain patent number strings
+                                    _bp_rows.append({
+                                        "Patent": str(bp),
+                                        "Score": "—",
+                                        "Claim Element": "",
+                                    })
                             st.dataframe(
                                 _pd_ws.DataFrame(_bp_rows),
                                 use_container_width=True,
@@ -675,14 +1162,14 @@ or replace professional patent counsel.
                         )
                         st.caption(conf.get("rationale", ""))
                         st.caption(ws.get("data_completeness", ""))
-                        st.caption(f"⚠️ {ws.get('disclaimer', '')}")
+                        st.caption(f"{ws.get('disclaimer', '')}")
 
-    # Tab 3 — Landscape
+    # Tab 4 — Landscape
     with tab_landscape:
         st.subheader("Patent Landscape")
         landscape_figs = st.session_state.get("landscape_figures")
         landscape_df_raw = st.session_state.get("landscape_patents")
-        if landscape_figs is None:
+        if not landscape_figs:
             st.info("Landscape charts will appear here after analysis.")
         else:
             n_patents = len(landscape_df_raw) if landscape_df_raw is not None else 0
@@ -729,7 +1216,7 @@ or replace professional patent counsel.
                 f"Analysis based on **{n_patents}** patents from the USPTO database."
             )
 
-    # Tab 4 — Report
+    # Tab 5 — Report
     with tab_report:
         st.subheader("Download Report")
 
@@ -749,7 +1236,7 @@ or replace professional patent counsel.
                 "Run the full analysis first for the most complete report."
             )
             for phase_name, done in _phases.items():
-                icon = "✅" if done else "⏳"
+                icon = "[x]" if done else "[ ]"
                 st.markdown(f"{icon} {phase_name}")
 
         # Allow generation even if landscape/whitespace incomplete
@@ -768,7 +1255,7 @@ or replace professional patent counsel.
 
         if st.session_state.get("_pdf_bytes"):
             st.download_button(
-                label="📥 Download PDF Report",
+                label="Download PDF Report",
                 data=st.session_state["_pdf_bytes"],
                 file_name="patentscout_report.pdf",
                 mime="application/pdf",
@@ -802,12 +1289,21 @@ or replace professional patent counsel.
             )
 
 
-# ---------------------------------------------------------------------------
+
 # Sidebar — input panel
-# ---------------------------------------------------------------------------
 
 with st.sidebar:
-    st.header("Describe Your Invention")
+    st.subheader("Describe Your Invention")
+
+    # Text description
+    invention_text = st.text_area(
+        label="Invention description",
+        label_visibility="collapsed",
+        value=st.session_state["invention_text"],
+        placeholder="Example: A portable solar panel that folds into a compact case and charges mobile phones via USB-C...",
+        height=200,
+    )
+    st.session_state["invention_text"] = invention_text
 
     # Image upload
     uploaded_file = st.file_uploader(
@@ -823,25 +1319,22 @@ with st.sidebar:
         else:
             st.session_state["invention_image"] = raw_bytes
             st.image(
-                Image.open(io.BytesIO(raw_bytes)),
-                caption="Uploaded sketch",
-                width=250,
+                st.session_state["invention_image"],
+                use_container_width=True,
             )
+            st.caption(f"✓ {uploaded_file.name}")
     else:
-        # User cleared the uploader — reset stored bytes
-        st.session_state["invention_image"] = None
+        # Only reset stored bytes if not loaded from a demo session
+        if not st.session_state.get("is_demo"):
+            st.session_state["invention_image"] = None
 
-    # Text description
-    invention_text = st.text_area(
-        "Describe your invention",
-        value=st.session_state["invention_text"],
-        placeholder=(
-            "Describe what your invention does, how it works, "
-            "and what problem it solves..."
-        ),
-        height=200,
-    )
-    st.session_state["invention_text"] = invention_text
+    # Show demo-loaded sketch in sidebar (file uploader not active)
+    if uploaded_file is None and st.session_state.get("invention_image"):
+        st.image(
+            st.session_state["invention_image"],
+            use_container_width=True,
+        )
+        st.caption("✓ doorbell_sketch.png")
 
     # Action buttons
     col_analyze, col_clear = st.columns([2, 1])
@@ -852,30 +1345,55 @@ with st.sidebar:
 
     st.caption("PatentScout is a research tool, not legal advice.")
 
-    # -- Demo load button -------------------------------------------------
+    # -- Demo load buttons (collapsible) --------------------------------
     st.divider()
-    demo_exists = os.path.exists(_DEMO_SESSION_PATH)
-    if demo_exists:
-        if st.button("🚀 Load Solar Charger Demo", use_container_width=True):
-            if _load_demo_session():
-                st.success("Demo session loaded!")
+    with st.expander("Explore Example Analyses", expanded=False):
+        if st.button("Solar Charger Demo", use_container_width=True, key="solar_demo"):
+            if _load_solar_demo():
+                _show_demo_progress()
                 st.rerun()
             else:
-                st.error("Could not load demo session file.")
+                st.error("Could not load solar charger demo data.")
+        if st.button("Doorbell Demo (Text + Sketch)", use_container_width=True, key="doorbell_demo"):
+            if _load_doorbell_demo():
+                _show_demo_progress()
+                st.rerun()
+            else:
+                st.error("Could not load doorbell demo data.")
+
+    # -- "Try Another Invention" button ------------------------------------
+    st.divider()
+    if st.session_state.get("analysis_complete"):
+        if st.button("Try Another Invention", use_container_width=True):
+            keys_to_clear = [
+                "invention_text", "invention_image", "sketch_used",
+                "is_demo", "analysis_timestamp",
+                "detail_patents", "landscape_patents", "parsed_claims",
+                "similarity_results", "comparison_matrix", "white_spaces",
+                "search_strategy", "landscape_figures", "chart_images",
+                "analysis_complete", "_pdf_bytes", "query_cache",
+            ]
+            for key in keys_to_clear:
+                if key in st.session_state:
+                    del st.session_state[key]
+            st.rerun()
 
     # -- Query cost widget -------------------------------------------------
     total_gb = st.session_state.get("total_gb_scanned", 0.0) or 0.0
     if total_gb > 0:
-        st.caption(f"📊 Total GB scanned this session: **{total_gb:.2f} GB**")
+        st.caption(f"Total GB scanned this session: **{total_gb:.2f} GB**")
         if total_gb > 15:
             st.warning(
-                f"⚠️ {total_gb:.1f} GB scanned — approaching 20 GB budget cap."
+                f"{total_gb:.1f} GB scanned — approaching 20 GB budget cap."
             )
 
     # Handle Clear
     if clear_clicked:
         st.session_state["invention_text"] = ""
         st.session_state["invention_image"] = None
+        st.session_state["sketch_used"] = False
+        st.session_state["is_demo"] = False
+        st.session_state["analysis_timestamp"] = ""
         st.session_state["analysis_complete"] = False
         st.session_state["prior_art_results"]  = None
         st.session_state["claim_analysis"]       = None
@@ -891,51 +1409,47 @@ with st.sidebar:
         st.session_state["chart_images"]         = {}
         st.session_state["white_spaces"]         = None
         st.session_state["_pdf_bytes"]            = None
-    # ---------------------------------------------------------------------------
-    # Extracted features expander — shown after a successful analysis
-    # ---------------------------------------------------------------------------
-    strategy = st.session_state.get("search_strategy")
-    if strategy:
-        st.divider()
-        with st.expander("🔍 Extracted Features", expanded=True):
-            features = strategy.get("features", [])
-            if features:
-                for feat in features:
-                    st.markdown(f"**{feat['label']}**")
-                    st.caption(feat.get("description", ""))
-                    keywords = feat.get("keywords", [])
-                    if keywords:
-                        st.write("Keywords: " + " · ".join(keywords))
-                    st.write("")
 
-            cpc_list = strategy.get("cpc_codes", [])
-            if cpc_list:
-                st.markdown("**Predicted CPC Codes**")
-                for cpc in cpc_list:
-                    st.markdown(f"- `{cpc['code']}` — {cpc.get('rationale', '')}")
 
-# ---------------------------------------------------------------------------
+
 # Main area — welcome or results
-# ---------------------------------------------------------------------------
 
 if not analyze_clicked and not st.session_state["analysis_complete"]:
-    # Welcome message
-    st.title("PatentScout")
+    # Welcome / empty state
     st.markdown(
-        """
-        **PatentScout** helps inventors and product teams understand the patent
-        landscape around a new idea — before you invest in development.
-
-        **What it does:**
-        - Retrieves semantically similar prior-art patents from Google Patents
-        - Maps your invention's features against existing patent claims
-        - Visualises the patent landscape so you can spot white space
-        - Generates a downloadable analysis report
-
-        **To get started**, describe your invention in the sidebar and click
-        **Analyze**.
-        """
+        '<h1 style="font-size:40px; font-weight:700; margin-bottom:0; padding-bottom:0;">'
+        'PatentScout</h1>',
+        unsafe_allow_html=True,
     )
+    st.markdown(
+        '<p style="font-size:18px; color:#6c757d; margin-top:4px; margin-bottom:24px;">'
+        'Patent Prior Art Research Tool</p>',
+        unsafe_allow_html=True,
+    )
+    st.markdown(
+        "**AI-powered patent landscape analysis.** PatentScout helps inventors and product "
+        "teams understand the prior art landscape around their ideas before investing in development."
+    )
+
+    st.divider()
+    st.markdown("### How It Works")
+
+    cols = st.columns(4, gap="medium")
+    steps = [
+        ("\u2460 Describe", "Enter your invention concept and optionally upload a design sketch"),
+        ("\u2461 Extract", "AI identifies key technical features and relevant patent classifications"),
+        ("\u2462 Analyze", "Patents are retrieved, claims parsed, and compared against your features"),
+        ("\u2463 Report", "Download a detailed prior art landscape report with actionable insights"),
+    ]
+    for col, (title, desc) in zip(cols, steps):
+        with col:
+            st.markdown(f"**{title}**")
+            st.caption(desc)
+
+    st.divider()
+    st.markdown("### \u2192 Describe your invention in the sidebar and click **Analyze**")
+    st.caption("Or explore a pre-built example \u2014 expand *Explore Example Analyses* in the sidebar")
+    st.caption("Powered by: Gemini 2.0 Flash \u00b7 Google BigQuery Patents \u00b7 sentence-transformers")
 
 elif analyze_clicked:
     # Validate input
@@ -947,6 +1461,9 @@ elif analyze_clicked:
     if not is_valid:
         st.error(error_msg)
     else:
+        from datetime import datetime as _dt_pipeline
+        st.session_state["is_demo"] = False
+        st.session_state["analysis_timestamp"] = _dt_pipeline.now().strftime("%Y-%m-%d %H:%M")
         _pipeline_start = time.time()
         try:
             with st.spinner("Extracting features and building search strategy..."):
@@ -964,7 +1481,7 @@ elif analyze_clicked:
             n_cpc = len(strategy.get("cpc_codes", []))
             n_terms = len(strategy.get("search_terms", []))
             st.success(
-                f"✅ Extracted {n_features} features, predicted {n_cpc} CPC "
+                f"Extracted {n_features} features, predicted {n_cpc} CPC "
                 f"codes, generated {n_terms} search term groups"
             )
 
@@ -979,13 +1496,13 @@ elif analyze_clicked:
                         1 for f in strategy["features"] if f.get("patent_language")
                     )
                     st.caption(
-                        f"🔬 Patent-language reformulation: "
+                        f"Patent-language reformulation: "
                         f"{reformulated}/{n_features} features rewritten."
                     )
                 except Exception as _ref_exc:
                     logger.warning("Feature reformulation failed: %s", _ref_exc)
                     st.caption(
-                        "ℹ️ Reformulation skipped — using original descriptions for similarity."
+                        "Reformulation skipped — using original descriptions for similarity."
                     )
 
             # -- Patent retrieval with query cache -------------------------
@@ -999,13 +1516,17 @@ elif analyze_clicked:
                 st.session_state["detail_patents"]    = detail_df
                 st.session_state["landscape_patents"] = landscape_df
                 st.session_state["analysis_complete"] = True
-                st.caption("♻️ Results loaded from session cache (no new BigQuery charges).")
+                st.caption("Results loaded from session cache (no new BigQuery charges).")
             else:
-                with st.spinner("Searching patent database (⏳ usually 15–30 s)..."):
+                with st.spinner("Searching patent database (usually 15–30 s)..."):
                     try:
                         _bq_client = _get_bigquery_client()
                         retriever = PatentRetriever(bq_client=_bq_client)
-                        detail_df, landscape_df = retriever.search(strategy)
+                        _desc = st.session_state.get("invention_text", "")
+                        detail_df, landscape_df = retriever.search(
+                            strategy, user_description=_desc,
+                        )
+
                         st.session_state["detail_patents"]    = detail_df
                         st.session_state["landscape_patents"] = landscape_df
                         st.session_state["analysis_complete"] = True
@@ -1132,7 +1653,7 @@ elif analyze_clicked:
                     except Exception as _sim_exc:
                         logger.warning("EmbeddingEngine failed: %s", _sim_exc)
                         st.warning(
-                            f"⚠️ Similarity analysis failed: {_sim_exc}. "
+                            f"Similarity analysis failed: {_sim_exc}. "
                             "Continuing with remaining phases."
                         )
                         st.session_state["similarity_results"] = {"error": str(_sim_exc), "matches": [], "stats": {}}
@@ -1156,7 +1677,11 @@ elif analyze_clicked:
                 ):
                     try:
                         _mapper = ElementMapper(gemini_client=_gemini_client)
-                        _enriched = _mapper.analyze_matches(_sim_results)
+                        _enriched = _mapper.analyze_matches(
+                            _sim_results,
+                            invention_description=st.session_state.get("invention_text", ""),
+                            detail_patents=st.session_state.get("detail_patents"),
+                        )
                         st.session_state["comparison_matrix"] = _enriched
                     except Exception as _gem_exc:
                         logger.warning(
@@ -1206,24 +1731,13 @@ elif analyze_clicked:
             logger.info("Full pipeline completed in %.1f s", _elapsed)
             _total_gb = st.session_state.get("total_gb_scanned", 0.0) or 0.0
             st.caption(
-                f"⏱ Analysis completed in {_elapsed:.0f} seconds.  "
-                f"📊 Total GB scanned: {_total_gb:.2f} GB"
+                f"Analysis completed in {_elapsed:.0f} seconds.  "
+                f"Total GB scanned: {_total_gb:.2f} GB"
             )
-
-            # Auto-save demo session if invention matches solar charger keyword
-            _inv_text = st.session_state.get("invention_text", "").lower()
-            if any(kw in _inv_text for kw in ("solar", "portable charger", "usb-c", "foldable")):
-                try:
-                    _save_demo_session()
-                    st.caption(
-                        "💾 Demo session saved to `examples/solar_charger_session.json`"
-                    )
-                except Exception as _save_exc:
-                    logger.warning("Demo save failed: %s", _save_exc)
         except Exception as exc:
             logger.exception("Pipeline top-level exception")
             st.error(
-                f"❌ Analysis failed during feature extraction: {exc}\n\n"
+                f"Analysis failed during feature extraction: {exc}\n\n"
                 "Please check your Gemini API key and try again. "
                 "If the problem persists, try a shorter description."
             )

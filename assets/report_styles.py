@@ -9,9 +9,8 @@ from reportlab.lib.colors import HexColor
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.enums import TA_CENTER, TA_LEFT, TA_JUSTIFY
 
-# ---------------------------------------------------------------------------
+
 # Colour palette (spec-required names)
-# ---------------------------------------------------------------------------
 PRIMARY    = HexColor('#2C3E50')
 SECONDARY  = HexColor('#34495E')
 ACCENT     = HexColor('#3498DB')
@@ -23,9 +22,8 @@ WHITE      = HexColor('#FFFFFF')
 # Internal helpers
 _ROW_ALT = HexColor('#F8FBFD')
 
-# ---------------------------------------------------------------------------
+
 # Paragraph styles
-# ---------------------------------------------------------------------------
 _base = getSampleStyleSheet()
 
 title_style = ParagraphStyle(
@@ -118,7 +116,7 @@ small_style = ParagraphStyle(
 disclaimer_style = ParagraphStyle(
     'PSDisclaimer',
     parent=_base['Normal'],
-    textColor=WARNING,
+    textColor=PRIMARY,
     fontSize=10,
     leading=15,
     spaceAfter=0,
@@ -126,9 +124,8 @@ disclaimer_style = ParagraphStyle(
     fontName='Helvetica',
 )
 
-# ---------------------------------------------------------------------------
+
 # Table style helpers
-# ---------------------------------------------------------------------------
 TABLE_HEADER_STYLE = [
     ('BACKGROUND',    (0, 0), (-1, 0), PRIMARY),
     ('TEXTCOLOR',     (0, 0), (-1, 0), WHITE),
@@ -154,9 +151,8 @@ TABLE_BODY_STYLE = [
 
 BASE_TABLE_STYLE = TABLE_HEADER_STYLE + TABLE_BODY_STYLE
 
-# ---------------------------------------------------------------------------
+
 # Additional paragraph styles for match-detail pages
-# ---------------------------------------------------------------------------
 mono_style = ParagraphStyle(
     'PSMono',
     parent=_base['Normal'],

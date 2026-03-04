@@ -73,9 +73,7 @@ class ConfidenceScorer:
             }
         return handler(supporting_data)
 
-    # ------------------------------------------------------------------
     # Private per-type scorers
-    # ------------------------------------------------------------------
 
     def _feature_gap(self, data: dict) -> dict:
         total: int = int(data.get("total_patents", 0))

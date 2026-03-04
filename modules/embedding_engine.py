@@ -1,16 +1,9 @@
 """
 PatentScout — Embedding Engine Module
 
-Loads the sentence-transformers model (cached via st.cache_resource so it is
-only downloaded / initialised once per Streamlit process lifetime) and
-computes a full cosine-similarity matrix between user invention features and
-parsed patent claim elements.
-
-Improvements (optimize/bigquery-embed):
-- Accepts feature["patent_language"] for reformulated patent-style text.
-- Computes similarity as elementwise max(original_sim, reformulated_sim)
-  so the best encoding wins.
-- Falls back to a smaller model if the primary model fails to load.
+Computes cosine-similarity matrix between invention features and parsed patent
+claim elements using sentence-transformers embeddings. Supports optional
+patent-language reformulation — takes elementwise max of both similarity scores.
 """
 
 from __future__ import annotations
@@ -28,49 +21,31 @@ logger = logging.getLogger(__name__)
 
 
 class EmbeddingEngine:
-    """
-    Wraps a sentence-transformers model to encode text into dense embedding
-    vectors and compute cosine similarity between invention features and
-    patent claim elements.
-
-    The underlying model is loaded once per Streamlit server process via
-    :func:`_load_model` which is decorated with ``@st.cache_resource``.
-    """
+    """Sentence-transformer wrapper for feature-vs-claim cosine similarity."""
 
     def __init__(self) -> None:
         self.model, self.model_name = self._load_model()
 
     @staticmethod
     @st.cache_resource
+    # load model once per process; fall back to smaller model if needed
     def _load_model() -> tuple[SentenceTransformer, str]:
-        """Load (or retrieve from cache) the sentence-transformers model.
-
-        Falls back to a smaller model if the primary fails.
-
-        Returns:
-            ``(model, model_name_used)``
-        """
         primary = settings.EMBEDDING_MODEL_NAME
         fallback = settings.EMBEDDING_MODEL_FALLBACK_NAME
 
         try:
             m = SentenceTransformer(primary)
-            logger.info("Embedding model loaded: %s", primary)
+            logger.info("embedding model loaded: %s", primary)
             return m, primary
         except Exception as exc:
             logger.warning(
-                "Primary embedding model '%s' failed (%s) — trying fallback '%s'",
+                "primary embedding model '%s' failed (%s) — trying fallback '%s'",
                 primary, exc, fallback,
-            )
-            print(
-                f"[EmbeddingEngine] Primary model '{primary}' failed: {exc}\n"
-                f"  Trying fallback: '{fallback}'"
             )
 
         try:
             m = SentenceTransformer(fallback)
-            logger.info("Fallback embedding model loaded: %s", fallback)
-            print(f"[EmbeddingEngine] Fallback model '{fallback}' loaded successfully.")
+            logger.info("fallback embedding model loaded: %s", fallback)
             return m, fallback
         except Exception as exc2:
             raise RuntimeError(
@@ -80,46 +55,15 @@ class EmbeddingEngine:
                 f"  Last error: {exc2}"
             ) from exc2
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
 
     def compute_similarity_matrix(
         self,
         features: list[dict],
         parsed_claims: list[dict],
     ) -> dict:
-        """
-        Compute cosine similarity between every user feature and every parsed
-        claim element.
-
-        If a feature contains a ``"patent_language"`` key (added by
-        :meth:`QueryBuilder.reformulate_features_for_patent_language`), both
-        the original description *and* the patent-language reformulation are
-        encoded.  The similarity score used is the elementwise maximum so the
-        better-matching encoding always wins.
-
-        Args:
-            features:
-                List of feature dicts, each with at least a ``"label"`` and
-                ``"description"`` key (as produced by QueryBuilder).
-            parsed_claims:
-                List of parsed-claim dicts as produced by ClaimParser
-                (each must contain ``"patent_number"`` and
-                ``"independent_claims"``).
-
-        Returns:
-            A dict with keys:
-                ``matrix``             – raw numpy similarity matrix (F × E)
-                ``feature_labels``     – list of feature label strings
-                ``element_refs``       – list of element reference dicts
-                ``matches``            – flat list of match dicts (top-10 per feature)
-                ``unmatched_features`` – features with no HIGH/MODERATE match
-                ``stats``              – summary counts
-            On error:
-                ``matrix`` is ``None``, ``error`` contains a message.
-        """
-        # Step 1 — Feature texts (original + optional patent-language)
+        """compute feature-vs-claim cosine similarity matrix."""
+        # step 1: feature texts (original + optional patent-language)
         feature_texts_orig   = [f.get("description", "") for f in features]
         feature_texts_patent = [
             f.get("patent_language") or f.get("description", "")
@@ -132,7 +76,7 @@ class EmbeddingEngine:
             for f in features
         )
 
-        # Step 2 — Collect all claim elements with source tracking
+        # step 2: collect claim elements with source tracking
         element_texts: list[str] = []
         element_refs: list[dict] = []
 
@@ -149,7 +93,7 @@ class EmbeddingEngine:
                         }
                     )
 
-        # Edge-case: no elements could be parsed
+        # edge case: no elements parsed
         if not element_texts:
             return {
                 "matrix": None,
@@ -158,7 +102,7 @@ class EmbeddingEngine:
                 "error": "No claim elements were successfully parsed",
             }
 
-        # Step 3 — Encode
+        # step 3: encode
         element_embeddings = self.model.encode(
             element_texts, show_progress_bar=False
         )
@@ -177,19 +121,14 @@ class EmbeddingEngine:
             # Elementwise maximum — best encoding wins
             sim_matrix = np.maximum(sim_orig, sim_patent)
             logger.info(
-                "Similarity matrix: used elementwise max(original, patent_language). "
-                "Improvement vs original: %.4f avg",
+                "similarity matrix: max(orig, patent_language), avg delta %.4f",
                 float((sim_matrix - sim_orig).mean()),
-            )
-            print(
-                f"[EmbeddingEngine] Used max(original, patent_language) similarity. "
-                f"Avg improvement: {(sim_matrix - sim_orig).mean():.4f}"
             )
         else:
             sim_matrix = sim_orig
             logger.info("Similarity matrix: patent_language not available — using original only.")
 
-        # Step 4 — Build structured results
+        # step 4: build structured results
         matches: list[dict] = []
         unmatched_features: list[dict] = []
 
@@ -235,6 +174,20 @@ class EmbeddingEngine:
 
             # Keep top-10 matches per feature
             matches.extend(feature_matches[:10])
+
+        # Deduplicate matches: one entry per (feature, patent, element)
+        _dedup_seen: set[tuple] = set()
+        _dedup_matches: list[dict] = []
+        for m in matches:
+            key = (
+                m["feature_label"],
+                m["patent_number"],
+                m.get("element_id", ""),
+            )
+            if key not in _dedup_seen:
+                _dedup_seen.add(key)
+                _dedup_matches.append(m)
+        matches = _dedup_matches
 
         return {
             "matrix": sim_matrix,

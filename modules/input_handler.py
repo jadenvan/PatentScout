@@ -26,9 +26,8 @@ MIN_DESCRIPTION_LENGTH = 50
 MAX_IMAGE_DIMENSION = 1024
 
 
-# ---------------------------------------------------------------------------
+
 # Module-level helper functions (used directly by app.py)
-# ---------------------------------------------------------------------------
 
 
 def validate_input(
@@ -110,9 +109,8 @@ def encode_image(file_bytes: bytes) -> str:
     return base64.b64encode(resized).decode("utf-8")
 
 
-# ---------------------------------------------------------------------------
+
 # Class-based interface (used by downstream pipeline modules)
-# ---------------------------------------------------------------------------
 
 
 class InputHandler:

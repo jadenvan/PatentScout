@@ -23,7 +23,6 @@ from config import settings
 # ---------------------------------------------------------------------------
 # Models to try in order (first available / non-rate-limited wins).
 # gemini-1.5-* are excluded — deprecated and return 404 on v1beta.
-# ---------------------------------------------------------------------------
 _MODELS = [
     "gemini-2.5-flash",
     "gemini-2.0-flash",
@@ -178,9 +177,7 @@ class QueryBuilder:
         self._client = genai.Client(api_key=api_key)
         self._model: Optional[str] = None  # resolved on first call
 
-    # ------------------------------------------------------------------
     # Internal helpers
-    # ------------------------------------------------------------------
 
     def _call_gemini_ordered(self, contents: list, models: "list[str]") -> str:
         """
@@ -243,9 +240,7 @@ class QueryBuilder:
         _validate_structure(data)
         return data
 
-    # ------------------------------------------------------------------
     # Public API
-    # ------------------------------------------------------------------
 
     def extract_features(
         self,

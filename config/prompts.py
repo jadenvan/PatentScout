@@ -5,11 +5,7 @@ Placeholder prompt strings for Gemini API calls.
 Each prompt will be filled in during later development phases.
 """
 
-# ---------------------------------------------------------------------------
 # Feature Extraction
-# Instructs Gemini to extract key technical features from an invention
-# description or sketch analysis.
-# ---------------------------------------------------------------------------
 FEATURE_EXTRACTION_PROMPT = """You are an expert patent research assistant with deep knowledge of patent
 classification systems (CPC/IPC) and patent claim drafting conventions.
 
@@ -70,24 +66,21 @@ Rules you MUST follow:
    be '{' and the last must be '}'.
 """
 
-# ---------------------------------------------------------------------------
 # CPC Code Prediction
-# Instructs Gemini to predict the most relevant CPC classification codes
-# for a described invention.
-# ---------------------------------------------------------------------------
 CPC_PREDICTION_PROMPT = ""
 
-# ---------------------------------------------------------------------------
 # Claim Analysis — Phase 6 two-layer comparison
 # Instructs Gemini to contextually compare invention features against patent
 # claim elements and return structured JSON analysis.
 #
 # Usage: format with {pairs_text} and {n_pairs} before sending.
-# ---------------------------------------------------------------------------
 CLAIM_ANALYSIS_PROMPT = """\
 You are a technically rigorous patent analyst. Your task is to compare user
 invention features against specific patent claim elements to help identify
 potential similarities and technical distinctions.
+
+CONTEXT — The inventor's full concept:
+{invention_description}
 
 IMPORTANT GROUND RULES:
 - You are NOT making any determination of infringement or patentability.
@@ -97,6 +90,8 @@ IMPORTANT GROUND RULES:
   one technical distinction or note a limitation of this automated comparison.
 - Always acknowledge what a human expert would need to evaluate.
 - Use precise technical language consistent with patent claim interpretation.
+- Reference the specific patent and feature by name in your analysis.
+- Every field must contain analysis specific to THIS pair, not generic text.
 
 Analyse the following {n_pairs} feature-element pair(s).
 Return a JSON ARRAY with exactly {n_pairs} analysis object(s) — one per pair,
@@ -106,15 +101,38 @@ last character must be ']'.
 
 Each array element must conform to this schema:
 {{
-  "claim_element_explanation": "Plain-language explanation of what this claim element legally requires — what structure, step, or function must be present",
-  "similarity_assessment": "Specific technical comparison identifying concrete similarities and differences between the feature and the claim element",
+  "pair_index": "<integer, 1-based, matching the PAIR number from the input>",
+  "claim_element_explanation": "In plain English, what SPECIFIC technical requirement does this claim element impose? Name concrete components, actions, or configurations. Example: 'This element requires a hinged connection between adjacent solar panel segments that allows rotation of at least 180 degrees for folding.'",
+  "similarity_assessment": "Identify the SPECIFIC technical overlap between the inventor's feature and this claim element. Then identify the SPECIFIC differences. Do not say 'they are similar' — say exactly WHAT is similar and WHAT is different.",
   "key_distinctions": [
-    "A concrete technical difference (e.g. different mechanism, scope, implementation, or requirement)",
-    "Another distinction if present"
+    "Each item must be a specific technical difference — not generic observations. Example: 'The claim requires a tracking mechanism that follows the sun position, while the inventor concept is a static panel without tracking capability.'"
   ],
-  "cannot_determine": "What this automated comparison cannot determine without professional patent review — be specific about what doctrine, claim construction, or prior art analysis would be needed",
+  "cannot_determine": "Name one specific thing a patent attorney would need to assess for THIS comparison. Reference specific legal doctrine (e.g. doctrine of equivalents, means-plus-function analysis) that applies.",
   "confidence": "HIGH or MODERATE or LOW"
 }}
+
+CRITICAL REQUIREMENT FOR pair_index:
+- Each object MUST include "pair_index" matching the PAIR number from the input (1-based).
+
+CRITICAL REQUIREMENT FOR key_distinctions:
+- Each analysis object's "key_distinctions" must be SPECIFIC to that particular feature-element pair.
+- Reference the SPECIFIC feature name (e.g., "The enclosure feature differs because...").
+- Reference the SPECIFIC claim limitation being compared.
+- Do NOT provide generic distinctions about the overall invention.
+- If two different pairs have identical key_distinctions, you have failed the task.
+- Each distinction should identify a concrete technical difference between the feature and the specific claim element.
+- You MUST focus on the SPECIFIC CLAIM ELEMENT text, not just the feature.
+- Each claim element has different wording and technical scope.
+- Your distinctions must reference specific language FROM THE CLAIM ELEMENT being analysed.
+- If two pairs share the same feature but have different claim elements, their key_distinctions MUST differ.
+- Quote or paraphrase specific terms from the claim element in your distinction.
+
+CRITICAL REQUIREMENT FOR claim_element_explanation:
+- You are explaining what THIS SPECIFIC claim element requires.
+- Reference the specific technical language used in the claim element text.
+- If the claim says "monocrystalline silicon solar cells arranged in series", your explanation must mention monocrystalline, silicon, and series arrangement.
+- If a different claim says "polycrystalline photovoltaic cells electrically connected", your explanation must mention polycrystalline and the electrical connection topology.
+- Do NOT give the same explanation for different claim elements.
 
 Rules:
 1. "key_distinctions" MUST have at least one entry. If texts are nearly
@@ -122,31 +140,29 @@ Rules:
    nuances as a distinction.
 2. "cannot_determine" MUST be specific — never just say 'consult a lawyer'.
    Identify the specific legal doctrine (e.g. doctrine of equivalents,
-   claim differentiation, means-plus-function analysis) that applies.
+   claim differentiation, means-plus-function analysis) that applies to
+   THIS comparison.
 3. "confidence" reflects how confident you are in your similarity assessment:
    HIGH = strong conceptual and technical overlap
    MODERATE = partial overlap with notable differences
    LOW = superficial or incidental similarity only
 4. Do NOT infer infringement, freedom-to-operate conclusions, or validity.
+5. If the claim element is about a completely different technology, say so and
+   set confidence to LOW.
+6. 2-3 sentences maximum per field.
 
 {pairs_text}
 """
 
-# ---------------------------------------------------------------------------
 # Whitespace Identification
 # Instructs Gemini to identify potential IP whitespace / innovation gaps
 # from a set of patent abstracts and the user's invention description.
 #
 # The active prompt (_COMBINATION_PROMPT) lives in
 # modules/whitespace_finder.py; this placeholder is kept for reference.
-# ---------------------------------------------------------------------------
 WHITESPACE_PROMPT = ""  # see modules/whitespace_finder._COMBINATION_PROMPT
 
-# ---------------------------------------------------------------------------
 # Claim Parsing / Plain-English Translation
-# Instructs Gemini to decompose a patent claim into structured components
-# and produce a plain-English summary of each element.
-# ---------------------------------------------------------------------------
 CLAIM_PARSING_PROMPT = """You are an expert patent attorney assistant specialised in claim analysis.
 
 You will be given one or more numbered patent claims delimited by ===CLAIM START=== and ===CLAIM END===.
@@ -178,9 +194,8 @@ Rules:
 7. Return ONLY the JSON array.  No commentary before or after.
 """
 
-# ---------------------------------------------------------------------------
+
 # Feature Reformulation — rewrite natural-language features as patent claims
-# ---------------------------------------------------------------------------
 REFORMULATION_PROMPT = """\
 You are a patent-language rewriter. Given a JSON array of short feature
 descriptions, rewrite each as a concise (10-25 words) patent-claim-style
@@ -192,4 +207,44 @@ First character must be '[', last character must be ']'.
 
 Format:
 [{"original": "...", "patent_language": "..."}]
+"""
+
+# Specific Recommendations — generate actionable IP strategy advice
+RECOMMENDATION_PROMPT = """\
+You are a patent research advisor. Based on the analysis results below,
+generate 4-6 specific, actionable research recommendations for the inventor.
+Each recommendation should reference specific findings.
+
+CRITICAL RULES:
+- Do NOT recommend filing a patent application or provisional application.
+- Do NOT recommend pursuing patent protection or suggest patentability.
+- Do NOT provide legal advice of any kind.
+- ONLY recommend further research, investigation, and professional consultation.
+
+ANALYSIS SUMMARY:
+- Features analysed: {n_features}
+- High-confidence matches: {high_matches}
+- Moderate matches: {moderate_matches}
+- White-space opportunities: {white_spaces}
+- CPC codes searched: {cpc_codes}
+
+KEY FINDINGS:
+{key_findings}
+
+Return ONLY a JSON array of recommendation objects:
+[
+  {{
+    "priority": "HIGH" | "MEDIUM" | "LOW",
+    "category": "Design Around" | "Prior Art Investigation" | "Claim Analysis" | "International Search" | "Non-Patent Literature",
+    "recommendation": "Specific, actionable research recommendation (1-2 sentences)",
+    "rationale": "Brief explanation referencing specific analysis findings"
+  }}
+]
+
+Rules:
+1. Be specific — reference actual patent numbers or features from the findings.
+2. Prioritize based on competitive risk and opportunity.
+3. Never recommend filing, seeking patent protection, or specific legal conclusions.
+4. Frame all advice as "investigate further", "commission a search", or "request professional review".
+5. Return ONLY the JSON. No fences, no prose.
 """

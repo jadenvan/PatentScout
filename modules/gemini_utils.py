@@ -54,7 +54,7 @@ def generate_reformulations(
             with open(cache_file) as fh:
                 cached = json.load(fh)
             if len(cached) == len(features):
-                logger.info("Reformulations loaded from cache: %s", cache_file)
+                logger.info("reformulations loaded from cache: %s", cache_file)
                 for f, c in zip(features, cached):
                     f["patent_language"] = c.get("patent_language", f.get("description", ""))
                 return features
@@ -70,7 +70,7 @@ def generate_reformulations(
     if not api_key:
         api_key = os.getenv("GEMINI_API_KEY", "")
     if not api_key:
-        logger.warning("No GEMINI_API_KEY — using original descriptions")
+        logger.warning("no GEMINI_API_KEY — using original descriptions")
         for f in features:
             f.setdefault("patent_language", f.get("description", ""))
         return features
@@ -80,7 +80,7 @@ def generate_reformulations(
         qb = QueryBuilder(api_key=api_key)
         features = qb.reformulate_features_for_patent_language(features)
     except Exception as exc:
-        logger.warning("Reformulation failed (%s) — using originals", exc)
+        logger.warning("reformulation failed (%s) — using originals", exc)
         for f in features:
             f.setdefault("patent_language", f.get("description", ""))
 
@@ -103,4 +103,4 @@ def _save_cache(features: list[dict], cache_file: str) -> None:
         with open(cache_file, "w") as fh:
             json.dump(data, fh, indent=2)
     except Exception as exc:
-        logger.warning("Could not save reformulation cache: %s", exc)
+        logger.warning("could not save reformulation cache: %s", exc)

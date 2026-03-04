@@ -29,9 +29,8 @@ from config.prompts import CLAIM_PARSING_PROMPT
 
 logger = logging.getLogger(__name__)
 
-# ---------------------------------------------------------------------------
+
 # Constants
-# ---------------------------------------------------------------------------
 
 _TRANSITIONAL_PHRASES = [
     "consisting essentially of",
@@ -62,9 +61,8 @@ _GEMINI_MODELS = [
 ]
 
 
-# ---------------------------------------------------------------------------
+
 # Helpers
-# ---------------------------------------------------------------------------
 
 def _sanitise(text: str) -> str:
     """Normalise encoding, collapse whitespace, strip OCR garbage."""
@@ -157,9 +155,8 @@ def _make_element_id(claim_num: int, idx: int) -> str:
     return f"{claim_num}{letter}"
 
 
-# ---------------------------------------------------------------------------
+
 # Main class
-# ---------------------------------------------------------------------------
 
 
 class ClaimParser:
@@ -176,9 +173,7 @@ class ClaimParser:
     def __init__(self, gemini_client=None) -> None:
         self.gemini = gemini_client
 
-    # ------------------------------------------------------------------
     # Public: single patent
-    # ------------------------------------------------------------------
 
     def parse_claims(self, patent_number: str, raw_claims: str) -> dict:
         """
@@ -246,9 +241,7 @@ class ClaimParser:
             "parsing_confidence": confidence,
         }
 
-    # ------------------------------------------------------------------
     # Public: batch over DataFrame
-    # ------------------------------------------------------------------
 
     def parse_all(
         self,
@@ -289,7 +282,7 @@ class ClaimParser:
                 else:
                     failed += 1
             except Exception as exc:
-                logger.warning("Claim parsing failed for %s: %s", pub_num, exc)
+                logger.warning("claim parsing failed for %s: %s", pub_num, exc)
                 failed += 1
 
         return {
@@ -302,9 +295,7 @@ class ClaimParser:
             },
         }
 
-    # ------------------------------------------------------------------
     # Internal: single-claim regex parsing
-    # ------------------------------------------------------------------
 
     def _parse_single_claim(self, claim_num: int, text: str) -> dict:
         transition, idx = _find_transition(text)
@@ -326,6 +317,17 @@ class ClaimParser:
             {"id": _make_element_id(claim_num, i), "text": e}
             for i, e in enumerate(elements_raw)
         ]
+
+        # Deduplicate elements by normalised text
+        _seen_el: set[str] = set()
+        _unique_el: list[dict] = []
+        for el in elements:
+            norm = el["text"].strip().lower()
+            if norm not in _seen_el:
+                _seen_el.add(norm)
+                _unique_el.append(el)
+        elements = _unique_el
+
         return {
             "claim_number": claim_num,
             "full_text": text,
@@ -335,9 +337,7 @@ class ClaimParser:
             "plain_english": "",
         }
 
-    # ------------------------------------------------------------------
     # Internal: Gemini batch parsing
-    # ------------------------------------------------------------------
 
     def _gemini_parse_batch(
         self, claims: list[tuple[int, str]]
@@ -394,9 +394,7 @@ class ClaimParser:
         logger.warning("Gemini claim parsing failed: %s", last_exc)
         return []
 
-    # ------------------------------------------------------------------
     # Internal: empty result helper
-    # ------------------------------------------------------------------
 
     @staticmethod
     def _empty_result(patent_number: str, reason: str = "") -> dict:
