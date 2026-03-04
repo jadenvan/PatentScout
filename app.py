@@ -1410,6 +1410,8 @@ with st.sidebar:
         st.session_state["white_spaces"]         = None
         st.session_state["_pdf_bytes"]            = None
 
+    st.sidebar.divider()
+    st.sidebar.caption("PatentScout v1.0\nBuilt by Jaden Van")
 
 
 # Main area — welcome or results
